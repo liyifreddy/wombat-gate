@@ -38,4 +38,4 @@ bypass-selection = true
 
 [tool.hatch.build.targets.sdist]
 include = ["bin/", "hooks/", "skills/", "README.md", "README.zh-CN.md", "DESIGN.md", "PLAYBOOK.md",
-           "LICENSE", "selftest_wombat_gate.py"]
+           "REFERENCE.md", "LICENSE", "selftest_wombat_gate.py"]

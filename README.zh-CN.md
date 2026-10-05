@@ -1,41 +1,65 @@
-# 🕳️ wombat-gate（中文简介）
+# 🕳️ wombat-gate
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/liyifreddy/wombat-gate/main/docs/img/wombat-gate-banner.jpg" width="100%" alt="wombat-gate 横幅插图">
 </p>
 
-**一次只放一个进洞。** 让很多个 AI agent（或者人）共用同一个 git 工作区时，排队提交、互不踩脚的小工具。
+**一次只放一个进洞。** 几个 AI agent 共用一个 git 仓库时，让它们排队提交，而且每个只提交自己的文件。
 
-## 😩 痛点
+🌐 [English](https://github.com/liyifreddy/wombat-gate/blob/main/README.md) · **中文**
 
-几个 Claude Code session（或别的 agent）共用**一棵**工作树：
+## 🚀 快速上手
 
-- 🧺 **提交卷走别人的文件**：`git add -A`、`git commit -a`、不带路径的 `git commit` 会把邻居做了一半、已经暂存的东西一起提交走。写这个工具之前，我们两天里出过两次。
-- 🥊 **几个 agent 抢 git「打架」**：每次写索引都要拿 `.git/index.lock`，第二个写的直接报 `index.lock: File exists`，各自按自己的节奏重试，重试时又互相踩对方的索引。自测里 8 个直接用 git 的写者各提交 15 次，120 次只成了 1–10 次。
-- 🐢 **每次提交都扫整棵树**：`git commit` 先刷新索引，每个被跟踪的文件 `lstat()` 一次。2.2 万个文件、放在 WSL 9p 挂载的 Windows 盘上的仓库，一次就是几万个 9p 请求、30–70 秒；一阵提交高峰里 agent 排队最长等了 6 分钟。每个 9p 请求都要一块连续的内核内存，内存一紧，最先失败的就是这种扫全树的请求——然后整个挂载掉线，所有 session 一起受影响（我们 G 盘掉线的根因就是这一类）。
-- 💣 **agent 会顺手用整树命令**：`git add -A`、`git stash`、`git reset --hard`、`git checkout -- .`，把别的 session 的改动扔掉或卷走。
+```sh
+pipx install git+https://github.com/liyifreddy/wombat-gate
 
-## ✨ 你得到什么
+wombat-gate commit -m "修 parser" -- src/parser   # 只提交这些路径，排队轮流来
+wombat-gate run -- git push                       # 推送
+wombat-gate who                                   # 现在谁在洞里
+```
 
-- ✅ **只提交自己的路径**：`wombat-gate commit -m "说明" -- 路径…` 只提交这些路径；别人暂存的照旧暂存，不进你的提交。
-- ✅ **不再打架**：所有写者排队等同一把本地 `flock`，不再报错、重试、互相踩索引。自测 120 次提交全成；空闲机器上排队中位 0.14 秒、持锁中位 0.026 秒（另有 10 个 agent session 在跑时是 0.9 秒 / 0.16 秒）。
-- ✅ **不扫整棵树**：在私有的索引副本里建提交，只把你的路径嫁接到 `HEAD` 上，不去 stat 其余文件：上面那个 2.2 万文件的 9p 仓库，切换后第一次真实提交持锁 3.07 秒（原来 30–70 秒；只测了这一次，一般是「几秒」）。
-- ✅ **守卫 hook**：给 Claude Code 用，拦整树的 git 命令（暂存、提交、stash、reset、checkout、clean……）；自测 197 条命令逐条核该拦还是该放。
-- ✅ **从不删 git 的锁文件**：队列外的 git 进程占着锁时，退避重试。
-- ✅ **报告读真实提交**：打印的 sha 和文件列表来自它真正做出的那个提交，不是 `HEAD`。
-- ✅ **计时日志**：每次操作一行 JSON：排队多久、持锁多久、每一步 git 多久。
-- ✅ **Claude Code 一键装**：插件里有命令行、守卫 hook 和教 agent 规矩的 skill。自测每次都拿真实的 `git commit` 做对照，另有 36 个重新植入的历史 bug，每个都必须让某项检查变红。
+一个文件，Python ≥ 3.8，只用标准库。Linux、macOS、WSL 都能用。
 
-## 🕳️ 怎么做到的
+在 Claude Code 里装上插件（命令行 + 守卫 hook + 给 agent 的规矩）：
 
-袋熊被追的时候会钻进洞里，用屁股把洞口堵死——那是一块软骨加骨头的硬板，狐狸咬不动。洞里一次只有一只袋熊，别的都在外面等。（袋熊还会把立方体形状的便便摆在石头上，宣示「这是我的」。我们觉得对待自己的目录就该是这个态度。）
+```
+/plugin marketplace add liyifreddy/wombat-gate
+/plugin install wombat-gate@wombat-gate
+```
 
-**洞里一次只有一只袋熊 = 一次只有一个 session 往 git 里写。**
+## 😩 遇到的问题
+
+几个 Claude Code（或别的 agent）在同一个仓库里干活，很快就会碰到这些事：
+
+- 🧺 **提交带走了别人的文件。** `git add -A`、`git commit -a`，或者不带路径的 `git commit`，会把别人暂存了一半的改动也一起提交。我们两天里碰到过两次。
+- 🥊 **抢锁报错。** git 写索引前要先拿 `.git/index.lock`。两个进程同时来，后到的直接报 `index.lock: File exists`。自测里 8 个进程各提交 15 次，120 次只成功了 1–10 次。
+- 🐢 **每次提交都把整个仓库检查一遍。** 我们的仓库有 2.2 万个文件，放在 WSL 挂载的 Windows 盘上，一次提交要 30–70 秒，高峰时排队等了 6 分钟。机器内存一紧，这种大量的读盘请求最先出错，整个盘跟着掉线。
+- 💣 **agent 会用影响整个仓库的命令**，比如 `git stash`、`git reset --hard`、`git checkout -- .`，把别人的改动弄丢。
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/liyifreddy/wombat-gate/main/docs/img/wombat-gate-before-after.jpg" width="100%"
+       alt="之前：三个机器人在洞里撞成一团，箱子摔坏；之后：袋熊守在洞口一次放一个进去，它把箱子放上自己的格子，别的在外面等">
+</p>
+<p align="center"><sub>之前：大家一起挤进洞。之后：一次一个，各放各的格子。</sub></p>
+
+## ✨ 用了之后
+
+- ✅ **只提交你点名的路径。** 别人暂存的东西原样留着，不会进你的提交。
+- ✅ **排队，不报错。** 大家等同一把锁，轮到谁谁提交。自测 120 次全部成功；机器空闲时排队时间的中位数是 0.14 秒。
+- ✅ **不再检查整个仓库。** 只处理你给的路径。上面那个 2.2 万文件的仓库，换用之后第一次提交只用了 3 秒（原来 30–70 秒）。
+- ✅ **守卫 hook。** 在 Claude Code 里拦下影响整个仓库的 git 命令，用 197 条命令测过。
+- ✅ **不删 git 的锁文件。** 碰到别的 git 进程占着锁，就等一会再试。
+- ✅ **每次操作记一行日志**：排了多久、拿锁多久、每一步花了多久。
+- ✅ **装起来简单。** Claude Code 插件一条命令装好，带守卫 hook 和教 agent 规矩的说明。
+
+## 🕳️ 为什么叫袋熊
+
+袋熊遇到危险会钻进洞里，用屁股把洞口堵住。它的屁股是一块很硬的骨板，狐狸咬不动。洞里一次只待一只袋熊。wombat-gate 也是这样：一次只让一个 agent 进 git。（袋熊的便便是方的，它会把便便摆在石头上标地盘。我们觉得自己的目录也该这么守。）
 
 ```
   agent A ──┐                                      ┌──▶ 只提交 A 自己的路径
   agent B ──┼──▶ 排队 ──▶ 拿锁 ──▶ 写 ─────────────┤
-  agent C ──┘   （等）   （本地盘上的 flock）        └──▶ 放锁 ──▶ 下一个
+  agent C ──┘   （等）   （本地盘上的锁）           └──▶ 放锁 ──▶ 下一个
 ```
 
 <p align="center">
@@ -43,42 +67,58 @@
        alt="四格：机器人在洞口排队；一个跟袋熊进洞；在洞里只把自己的箱子放上自己的格子；出来，下一个进去">
 </p>
 
-1. **wait in queue（排队）**——要写 git 的 agent 都在洞外排队。
-2. **take the lock (flock, local disk)（拿锁，锁在本地盘）**——一次只进一个；锁是 `~/.local/state` 下的一个文件、在仓库之外，这个目录必须在本地盘上（不在时 wombat-gate 会警告）。
-3. **commit only your own paths（只提交自己的路径）**——在洞里只放下自己的箱子，也就是自己点名的路径。
-4. **release, next in line（放锁，下一个）**——出来、放锁，下一个进去。
+1. **排队**：要提交的 agent 在外面排队。
+2. **拿锁**：一次只进一个。锁放在 `~/.local/state` 下面，不在仓库里；这个目录要在本地盘上，不在的话 wombat-gate 会提醒。
+3. **只提交自己的路径**：进去的那个只放下自己的箱子。
+4. **放锁，下一个**：出来，下一个进去。
 
 <p align="center"><sub>Illustrations generated with Google Gemini and edited by the author.</sub></p>
 
-## 🧭 它做什么（细节）
+## 🧭 细节
 
-- **排队**：同一个仓库的所有写操作，都要先拿到本地盘上的同一把 `flock` 锁。持锁的进程死了，内核自动放锁，不留需要手删的锁文件。
-- **只提交你点名的路径**：`wombat-gate commit -m "说明" -- 你的文件或目录`。别人暂存的东西照旧暂存，不会进你的提交；`.`、仓库根、通配符、`:` 魔法路径一律拒绝。
-- **快**（0.6）：先按 git 自己的规矩拿住索引锁（`index.lock`），把索引复制一份到本地盘，只在副本上暂存你的路径，再把你的路径嫁接到 HEAD 的树上，不去 stat 整个工作区；用带旧值校验的 `update-ref` 移动分支，最后把副本写回索引——和 `git commit` 自己的做法一样，中途别的 git 进程插不进来。实测：2.2 万个文件、放在 WSL 9p 挂载盘上的仓库，每次占锁从 30–70 秒降到几秒。自测里每次都拿真实的 `git commit` 在仓库副本上做对照，提交出来的树、索引和退出码都要一致。
-- **退避重试**：没走 wombat-gate 的 git 进程占着 git 自己的锁时，等一等再试；从不删 git 的锁文件。
-- **只看自己路径的 status**：`wombat-gate status -- 路径`，不拿 `index.lock`。
-- ⛔ **逃生口只给人用**：`--allow-broad`、`run --unsafe` 在 agent 环境（`CLAUDECODE` 或 `WOMBAT_NO_ESCAPES=1`）里一律拒绝。
-- **耗时日志**：每次操作一行 JSON：排队多久、持锁多久、每一步 git 花了多久。
+- **锁不会卡死**：拿着锁的进程死了，系统会自动放锁，不会留下要手动删的锁文件。
+- **路径检查**：`.`、仓库根目录、通配符、`:` 开头的特殊路径都不接受，免得一不小心提交整个仓库。
+- **为什么快**：在索引的一份副本里只暂存你的路径，再把这些路径接到当前提交上；移动分支时先确认没有别人动过它；整个过程拿着 git 自己的索引锁，别的 git 进程插不进来。每次自测都和真正的 `git commit` 对比结果。
+- **只看自己的状态**：`wombat-gate status -- 路径`。
+- **给人用的开关**：`--allow-broad`、`run --unsafe` 在 agent 里一律拒绝。
+
+一步一步的过程见 [REFERENCE.md](REFERENCE.md)（英文）。
+
+## 🛠️ 用法
+
+```sh
+wombat-gate commit -m "parser: 处理空输入" -- src/parser tests/test_parser.py
+wombat-gate commit -n -m "..." -- src/parser   # 只看会提交什么，不真提交
+wombat-gate status -- src/parser               # 只看自己路径的状态
+wombat-gate run -- git push                    # push、fetch、tag、log 等（白名单）
+wombat-gate who                                # 现在谁在洞里
+wombat-gate log -n 50                          # 最近的耗时记录
+```
+
+设 `WOMBAT_SESSION=agent-7`（或加 `--session`），`who` 里就能看到是谁。
 
 ## 🤖 在 Claude Code 里用
 
-1. 装好命令行，在 `CLAUDE.md` 里写清规矩：✅ 提交用 `wombat-gate commit -m "…" -- <自己的路径>`，推送用 `wombat-gate run -- git push`；⛔ 不许 `git add -A` / `git commit -a` / `git stash`。
-2. 装 Bash 的 `PreToolUse` 守卫 hook（`hooks/guard.py`，或者直接装插件）：按 shell 的规则拆命令、按 git 真实的参数结构判断，拦整库暂存 / 提交、丢弃改动、关掉 agent 检查之类的写法。
-3. 在项目的 `.claude/settings.json` 里设 `{"env": {"WOMBAT_NO_ESCAPES": "1"}}`。
-
-也可以作为 Claude Code 插件安装（命令行、守卫 hook 和一段教 agent 规矩的 skill 一起装上）：
-
-```
-/plugin marketplace add liyifreddy/wombat-gate
-/plugin install wombat-gate@wombat-gate
-```
+1. 在 `CLAUDE.md` 里写清楚：提交用 `wombat-gate commit -m "说明" -- 你的路径`，推送用 `wombat-gate run -- git push`；不要用 `git add -A`、`git commit -a`、`git stash`。
+2. 装上守卫 hook（装插件就自带，见上面「快速上手」）。
+3. 在项目的 `.claude/settings.json` 里加 `{"env": {"WOMBAT_NO_ESCAPES": "1"}}`。
 
 ## ⚠️ 局限
 
-- 只有走 wombat-gate 的进程才排队；直接用 git 的进程照样会撞。所有 agent 都要换过来。
-- 锁必须放在本地盘上；Windows 侧的 git 看不到 WSL 里的锁。
-- 只管提交；你自己的 `git status`、`git log` 在慢盘上还是一样慢。
-- 两个 agent 提交同一个路径：先提交的那个会把两边的改动一起带走。给每个 agent 分不重叠的路径。
-- WSL + 9p：我们这里 WSL 内存耗尽时，`/mnt/<盘>` 会掉线（之后一直 I/O 错误，直到重新挂载）。这不是 wombat-gate 造成的，但跑得久的 git 命令往往最先撞上。
+- 只有用 wombat-gate 的进程才会排队，所以所有 agent 都要换过来。
+- 锁要放在本地盘上；Windows 那边的 git 看不到 WSL 里的锁。
+- 只加快提交；`git status`、`git log` 在慢盘上还是慢。
+- 两个 agent 改同一个文件，先提交的会把两边的改动一起带走。最好给每个 agent 分开的目录。
+- WSL 内存用光时，Windows 盘可能掉线。这不是 wombat-gate 引起的，但耗时长的 git 命令最容易碰上。
 
-详细说明见英文 [README](README.md)；设计取舍见 [DESIGN.md](DESIGN.md)；多 session 协作规范见 [PLAYBOOK.md](PLAYBOOK.md)。许可：MIT。
+## ✅ 自测
+
+```sh
+python3 selftest_wombat_gate.py               # 约 1 分钟，在本地盘上建临时仓库
+python3 selftest_wombat_gate.py --mutants     # 把 36 个修过的 bug 放回去，每个都必须被抓到
+bash hooks/selftest_guard.sh                  # 197 条命令，逐条核守卫该拦还是该放
+```
+
+每次快速提交的结果，都会和在仓库副本上直接跑 `git commit` 的结果对比。
+
+退出码、全部设置、每一条会被拒的命令见 [REFERENCE.md](REFERENCE.md)（英文）；设计思路见 [DESIGN.md](DESIGN.md)；多 session 怎么协作见 [PLAYBOOK.md](PLAYBOOK.md)。许可：MIT。
