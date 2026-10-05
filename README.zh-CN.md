@@ -1,4 +1,4 @@
-# 🕳️ wombat-gate
+# 🐨 wombat-gate
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/liyifreddy/wombat-gate/main/docs/img/wombat-gate-banner.jpg" width="100%" alt="wombat-gate 横幅插图">
