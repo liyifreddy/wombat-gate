@@ -22,6 +22,7 @@ Refuses to run when --base is on a network / 9p / drvfs mount.
 import argparse
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -34,9 +35,11 @@ TOOL = os.environ.get("SELFTEST_WOMBAT_BIN") or os.path.join(HERE, "bin", "womba
 sys.path.insert(0, HERE)
 
 RESULTS = []
+PREFIX = [""]  # "[classic] " / "[fast] " while scen_single runs in that commit mode
 
 
 def check(name, ok, detail=""):
+    name = PREFIX[0] + name
     RESULTS.append((name, bool(ok), detail))
     print("%s  %-58s %s" % ("PASS" if ok else "FAIL", name, detail), flush=True)
 
@@ -262,8 +265,17 @@ def gq(repo, env, *args, **kw):
                           capture_output=True, **kw)
 
 
-def scen_single(tmp, env):
-    repo = make_repo(os.path.join(tmp, "single"), env, 50)
+def scen_single(tmp, env, mode):
+    """Single-process checks, run once per commit mode (fast = default, classic = 0.5 path)."""
+    PREFIX[0] = "[%s] " % mode
+    try:
+        _scen_single(tmp, dict(env, WOMBAT_COMMIT_MODE=mode), mode)
+    finally:
+        PREFIX[0] = ""
+
+
+def _scen_single(tmp, env, mode):
+    repo = make_repo(os.path.join(tmp, "single-" + mode), env, 50)
     os.makedirs(os.path.join(repo, "mine"))
     os.makedirs(os.path.join(repo, "theirs"))
     for p in ("mine/a.txt", "theirs/b.txt", "mine/gone.txt"):
@@ -282,10 +294,14 @@ def scen_single(tmp, env):
     check("isolation: commit has only mine/ (incl. deletion)",
           r.returncode == 0 and sorted(files) == ["A\tmine/a.txt", "D\tmine/gone.txt"], repr(files))
     check("isolation: someone else's staged file is still staged", staged == ["theirs/b.txt"], repr(staged))
-    steps = read_log(env["WOMBAT_STATE_DIR"])[-1].get("steps", {})
+    last = read_log(env["WOMBAT_STATE_DIR"])[-1]
+    steps = last.get("steps", {})
+    want = ({"snapshot", "add", "diff", "commit", "diff_tree"} if mode == "classic" else
+            {"index_lock", "copy_index", "add", "write_tree", "graft", "head", "diff_tree", "commit_tree",
+             "update_ref", "write_index"})
     check("log: per-step timings recorded for a commit",
-          set(steps) >= {"snapshot", "add", "diff", "commit", "diff_tree"} and all(v >= 0 for v in steps.values()),
-          repr(sorted(steps)))
+          set(steps) >= want and all(v >= 0 for v in steps.values()) and last.get("mode") == mode,
+          repr((last.get("mode"), sorted(steps))))
 
     # status shows only the given path
     open(os.path.join(repo, "mine/new.txt"), "w").write("n\n")
@@ -369,9 +385,11 @@ def scen_single(tmp, env):
     open(os.path.join(repo, "mine/d.txt"), "w").write("d\n")
     open(lock, "w").close()
     e3 = dict(env, WOMBAT_GIT_BACKOFF="0.05", WOMBAT_GIT_RETRIES="2")
+    head_before = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
     r = gq(repo, e3, "commit", "-m", "d", "--", "mine")
-    check("stuck index.lock: exit 5, says how old, leaves it alone",
-          r.returncode == 5 and "age" in r.stderr and os.path.exists(lock),
+    same_head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip() == head_before
+    check("stuck index.lock: exit 5, says how old, leaves it alone, nothing committed",
+          r.returncode == 5 and "age" in r.stderr and os.path.exists(lock) and same_head,
           "rc %d" % r.returncode)
     os.remove(lock)
 
@@ -417,7 +435,7 @@ def scen_single(tmp, env):
           and sh(["git", "rev-parse", "HEAD"], repo, env).stdout == head, repr(rcs))
 
     # run push: not queued, works against a local bare remote, even while the queue is held
-    bare = os.path.join(tmp, "remote.git")
+    bare = os.path.join(tmp, "remote-%s.git" % mode)
     sh(["git", "init", "-q", "--bare", bare], tmp, env)
     sh(["git", "remote", "add", "origin", bare], repo, env)
     holder = subprocess.Popen([sys.executable, "-c", (
@@ -493,6 +511,14 @@ def scen_single(tmp, env):
     check("retry regex: lock collisions yes, disk/ref-conflict/remote errors no",
           all(g.RETRYABLE.search(s) for s in yes) and not any(g.RETRYABLE.search(s) for s in no))
 
+    if mode == "classic":
+        _classic_shim_checks(tmp, env, repo)
+    _scen_single_tail(tmp, env, repo)
+
+
+def _classic_shim_checks(tmp, env, repo):
+    """Foreign interference around `git commit` (classic path only: the fast path makes
+    no `git commit` call; scen_fast has its own interference checks)."""
     # --- verifier 0.2 findings ---------------------------------------------------
     # N1: a foreign commit lands while our commit hits index.lock. 0.2 reported the
     # foreign sha as ours (rc 0, our change left staged). Shim git: on the first
@@ -616,6 +642,8 @@ def scen_single(tmp, env):
     sh(["git", "add", "mine/f-new.txt"], repo, env)
     sh(["git", "commit", "-q", "-m", "f", "--", "mine/f-new.txt"], repo, env)
 
+
+def _scen_single_tail(tmp, env, repo):
     # N2: timeout edge cases
     rcs = [gq(repo, env, "commit", "--timeout", t, "-m", "x", "--", "mine").returncode for t in ("0", "-1", "nan", "inf")]
     holder = subprocess.Popen([sys.executable, "-c", (
@@ -716,6 +744,472 @@ def scen_single(tmp, env):
           r0.stdout == "" and len(r2.stdout.splitlines()) == 2, repr(len(r0.stdout)))
 
 
+# ---------------------------------------------------------------- 0.6 fast path
+
+def shim_git(tmp, env, tag, pattern, action, at=(1,), real_git=None):
+    """PATH shim for git: on the k-th call (k in `at`) whose ' argv ' matches the shell
+    case pattern, run `action` first ($G is the real git; the action may `exit`)."""
+    real_git = real_git or shutil.which("git", path=env.get("PATH"))
+    shim = os.path.join(tmp, "fshim-" + tag)
+    os.makedirs(shim, exist_ok=True)
+    cnt = os.path.join(tmp, "fshim-%s.count" % tag)
+    with open(os.path.join(shim, "git"), "w") as f:
+        f.write("#!/bin/sh\nG=%s\n"
+                "case \" $* \" in %s)\n"
+                "  n=$(( $(cat %s 2>/dev/null || echo 0) + 1 )); echo $n > %s\n"
+                "  case \" %s \" in *\" $n \"*) %s;; esac;;\n"
+                "esac\nexec $G \"$@\"\n" % (real_git, pattern, cnt, cnt, " ".join(map(str, at)), action))
+    os.chmod(os.path.join(shim, "git"), 0o755)
+    return dict(env, PATH=shim + os.pathsep + env["PATH"], WOMBAT_GIT_BACKOFF="0.05"), cnt
+
+
+# A commit made with plumbing only (no index, no index.lock), the way another
+# worktree or a script would move HEAD: sets PATH_ (in the tree) to CONTENT_.
+PLUMBING_COMMIT = ("T=$(mktemp); rm -f $T; GIT_INDEX_FILE=$T $G read-tree HEAD; "
+                   "b=$(printf '%s' \"$CONTENT_\" | $G hash-object -w --stdin); "
+                   "GIT_INDEX_FILE=$T $G update-index --add --cacheinfo 100644,$b,\"$PATH_\"; "
+                   "t=$(GIT_INDEX_FILE=$T $G write-tree); rm -f $T; "
+                   "c=$($G commit-tree $t -p HEAD -m \"$MSG_\" </dev/null); $G update-ref HEAD $c")
+
+
+def plumbing(path, content, msg):
+    return "PATH_=%s CONTENT_=%s MSG_=%s; %s" % (shlex.quote(path), shlex.quote(content), shlex.quote(msg),
+                                                 PLUMBING_COMMIT)
+
+
+def subj(repo, env, rev="HEAD"):
+    return sh(["git", "log", "-1", "--format=%s", rev], repo, env, check_rc=False).stdout.strip()
+
+
+def write(repo, rel, text):
+    p = os.path.join(repo, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(text)
+
+
+def scen_fast(tmp, env):
+    env = dict(env, WOMBAT_COMMIT_MODE="fast")
+    state = env["WOMBAT_STATE_DIR"]
+    repo = make_repo(os.path.join(tmp, "fast"), env, 20)
+    write(repo, "theirs/t.txt", "t0\n")
+    write(repo, "mine/base.txt", "b0\n")
+    sh(["git", "add", "theirs/t.txt", "mine/base.txt"], repo, env)
+    sh(["git", "commit", "-q", "-m", "base"], repo, env)
+
+    # (fa) HEAD moved by plumbing between our build and our update-ref: the
+    # compare-and-swap fails, we graft onto the new HEAD, the other change survives
+    es, _ = shim_git(tmp, env, "fa", '*" update-ref "*', plumbing("theirs/t.txt", "foreign-a\n", "FOREIGN-a"))
+    write(repo, "mine/a.txt", "a\n")
+    r = gq(repo, es, "commit", "-m", "own-a", "--", "mine")
+    last = read_log(state)[-1]
+    t_in_head = sh(["git", "show", "HEAD:theirs/t.txt"], repo, env, check_rc=False).stdout
+    head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
+    check("fast: HEAD moved before our update-ref -> re-graft on top, the other change kept",
+          r.returncode == 0 and last.get("rebuilds") == 1 and subj(repo, env) == "own-a"
+          and subj(repo, env, "HEAD~1") == "FOREIGN-a" and t_in_head == "foreign-a\n"
+          and last.get("commit") == head, repr((r.returncode, last.get("rebuilds"), subj(repo, env), t_in_head)))
+    sh(["git", "reset", "-q", "--", "theirs/t.txt"], repo, env)   # the plumbing commit left the index behind
+    write(repo, "theirs/t.txt", "foreign-a\n")
+
+    # (fb) the other commit already holds our change: nothing left -> exit 3
+    es, _ = shim_git(tmp, env, "fb", '*" update-ref "*', plumbing("mine/b.txt", "b\n", "FOREIGN-b"))
+    write(repo, "mine/b.txt", "b\n")
+    r = gq(repo, es, "commit", "-m", "own-b", "--", "mine")
+    last = read_log(state)[-1]
+    staged = sh(["git", "diff", "--cached", "--name-only", "--", "mine"], repo, env).stdout.split()
+    check("fast: our change already in the other commit -> exit 3, says so, index clean",
+          r.returncode == 3 and last.get("result") == "swept_by_foreign" and "another process" in r.stderr
+          and subj(repo, env) == "FOREIGN-b" and not staged, repr((r.returncode, last.get("result"), staged)))
+
+    # (fc) HEAD moves before every update-ref -> give up with 5, nothing of ours lands
+    es, _ = shim_git(tmp, env, "fc", '*" update-ref "*',
+                     "PATH_=theirs/t.txt CONTENT_=$(date +%N) MSG_=FOREIGN-c; " + PLUMBING_COMMIT,
+                     at=range(1, 20))
+    write(repo, "mine/c.txt", "c\n")
+    r = gq(repo, es, "commit", "-m", "own-c", "--", "mine")
+    last = read_log(state)[-1]
+    ours = [s for s in sh(["git", "log", "--format=%s"], repo, env).stdout.split("\n") if s == "own-c"]
+    check("fast: HEAD keeps moving -> exit 5 after 6 tries, no commit of ours",
+          r.returncode == 5 and last.get("result") == "head_kept_moving" and not ours,
+          repr((r.returncode, last.get("result"), len(ours))))
+    sh(["git", "reset", "-q", "--", "theirs/t.txt"], repo, env)
+    sh(["git", "checkout", "-q", "--", "theirs/t.txt"], repo, env)
+
+    # (fe) review 0.6 #1: a bare `git commit` by a non-wombat-gate process while we are
+    # committing must not get in (we hold index.lock from start to end)
+    rcf = os.path.join(tmp, "fe.rc")
+    es, _ = shim_git(tmp, env, "fe", '*" commit-tree "*',
+                     "$G add theirs/u.txt >/dev/null 2>&1; $G commit -q -m FOREIGN-e >/dev/null 2>&1; echo $? > %s" % rcf)
+    write(repo, "theirs/u.txt", "u\n")
+    write(repo, "mine/e.txt", "e\n")
+    r = gq(repo, es, "commit", "-m", "own-e", "--", "mine")
+    frc = open(rcf).read().strip() if os.path.exists(rcf) else "?"
+    subjects = sh(["git", "log", "-3", "--format=%s"], repo, env).stdout.split("\n")
+    in_head = sh(["git", "ls-tree", "-r", "--name-only", "HEAD", "--", "mine/e.txt"], repo, env).stdout.strip()
+    check("fast: a bare git commit during ours is locked out (index.lock held throughout)",
+          r.returncode == 0 and frc not in ("0", "?") and "FOREIGN-e" not in subjects and in_head == "mine/e.txt",
+          repr((r.returncode, frc, subjects)))
+    sh(["git", "add", "theirs/u.txt"], repo, env)
+    sh(["git", "commit", "-q", "-m", "u", "--", "theirs/u.txt"], repo, env)
+
+    # HEAD unreadable at the start (I/O error text on stderr): 0.5 took it for an
+    # unborn branch / a moved HEAD
+    head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
+    es, _ = shim_git(tmp, env, "fd", '*" rev-parse --verify -q HEAD "*',
+                     "echo 'error: unable to read HEAD: Input/output error' >&2; exit 128")
+    write(repo, "mine/d.txt", "d\n")
+    r = gq(repo, es, "commit", "-m", "own-d", "--", "mine")
+    last = read_log(state)[-1]
+    lock_left = os.path.exists(os.path.join(repo, ".git", "index.lock"))
+    check("fast: HEAD unreadable at start -> exit 1, says so, nothing committed, index.lock released",
+          r.returncode == 1 and last.get("result") == "head_unreadable" and "cannot read HEAD" in r.stderr
+          and "HEAD moved" not in r.stderr and not lock_left
+          and sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip() == head,
+          repr((r.returncode, last.get("result"), lock_left, r.stderr[-120:])))
+
+    # exec bit staged with --chmod=+x on a core.fileMode=false repo is committed (0.5 lost it)
+    sh(["git", "config", "core.fileMode", "false"], repo, env)
+    write(repo, "mine/run.sh", "#!/bin/sh\n")
+    sh(["git", "add", "mine/run.sh"], repo, env)
+    sh(["git", "update-index", "--chmod=+x", "mine/run.sh"], repo, env)
+    r = gq(repo, env, "commit", "-m", "x-bit", "--", "mine")
+    mode = sh(["git", "ls-tree", "HEAD", "--", "mine/run.sh"], repo, env).stdout.split()[:1]
+    check("fast: exec bit staged with --chmod=+x (core.fileMode=false) is committed",
+          r.returncode == 0 and mode == ["100755"], repr((r.returncode, mode)))
+    sh(["git", "config", "core.fileMode", "true"], repo, env)
+    os.chmod(os.path.join(repo, "mine/run.sh"), 0o755)  # match the committed mode again
+
+    # hooks: prepare-commit-msg edits, commit-msg sees the index being committed,
+    # post-commit runs after the index is written and its output is shown;
+    # --no-verify; core.hooksPath; a pre-commit hook sends the commit down the classic path
+    hooks = os.path.join(repo, ".git", "hooks")
+
+    def hook(name, body, d=hooks):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "w") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(os.path.join(d, name), 0o755)
+    hook("prepare-commit-msg", 'echo "PCM-ADDED $2" >> "$1"\n')
+    hook("commit-msg", 'echo "CM-SEES=[$(git diff --cached --name-only HEAD -- mine)]"\n')
+    hook("post-commit", 'echo "POST-STAGED=[$(git diff --cached --name-only -- mine)]"\n')
+    write(repo, "mine/h.txt", "h\n")
+    r = gq(repo, env, "commit", "-m", "own-h", "--", "mine")
+    body = sh(["git", "log", "-1", "--format=%B"], repo, env).stdout
+    check("fast: hooks -- prepare-commit-msg edits, commit-msg sees our files, post-commit after the index",
+          r.returncode == 0 and "PCM-ADDED message" in body and "CM-SEES=[mine/h.txt]" in r.stdout
+          and "POST-STAGED=[]" in r.stdout, repr((r.returncode, body, r.stdout[-160:])))
+    for n in ("prepare-commit-msg", "post-commit"):
+        os.remove(os.path.join(hooks, n))
+    hook("commit-msg", "echo rejected-by-hook >&2\nexit 1\n")
+    write(repo, "mine/h2.txt", "h2\n")
+    head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
+    r1 = gq(repo, env, "commit", "-m", "own-h2", "--", "mine")
+    same = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip() == head
+    staged = sh(["git", "diff", "--cached", "--name-only", "--", "mine"], repo, env).stdout.split()
+    r2 = gq(repo, env, "commit", "--no-verify", "-m", "own-h2", "--", "mine")
+    check("fast: commit-msg rejection -> exit 1, nothing committed or staged; --no-verify skips it",
+          r1.returncode == 1 and "rejected-by-hook" in r1.stderr and same and not staged and r2.returncode == 0
+          and subj(repo, env) == "own-h2", repr((r1.returncode, same, staged, r2.returncode)))
+    os.remove(os.path.join(hooks, "commit-msg"))
+    alt = os.path.join(tmp, "fast-hookspath")
+    hook("commit-msg", "echo rejected-by-hookspath >&2\nexit 1\n", d=alt)
+    sh(["git", "config", "core.hooksPath", alt], repo, env)
+    write(repo, "mine/h3.txt", "h3\n")
+    r = gq(repo, env, "commit", "-m", "own-h3", "--", "mine")
+    sh(["git", "config", "--unset", "core.hooksPath"], repo, env)
+    check("fast: core.hooksPath is honoured", r.returncode == 1 and "rejected-by-hookspath" in r.stderr,
+          repr(r.returncode))
+
+    # fallbacks to the classic path
+    def mode_of(*cmd, **cfg):
+        for k, v in cfg.items():
+            sh(["git", "config", k.replace("_", "."), v], repo, env)
+        write(repo, "mine/fb.txt", "%f\n" % time.time())
+        r = gq(repo, env, "commit", *cmd, "--", *(["MINE"] if "ci" in cmd else ["mine"]))
+        for k in cfg:
+            sh(["git", "config", "--unset", k.replace("_", ".")], repo, env)
+        rec = read_log(state)[-1]
+        return r.returncode, rec.get("mode"), rec.get("classic_reason", "")
+    hook("pre-commit", "exit 0\n")
+    pc = mode_of("-m", "pc")
+    pcn = mode_of("--no-verify", "-m", "pcn")
+    os.remove(os.path.join(hooks, "pre-commit"))
+    gpg = mode_of("-m", "gpg", commit_gpgsign="true", gpg_program="false")
+    open(os.path.join(repo, ".git", "MERGE_HEAD"), "w").write(head + "\n")
+    mh = mode_of("-m", "mh")
+    os.remove(os.path.join(repo, ".git", "MERGE_HEAD"))
+    sh(["git", "config", "core.ignorecase", "true"], repo, env)
+    ci = mode_of("-m", "ci")
+    sh(["git", "config", "core.ignorecase", "false"], repo, env)
+    check("fast: classic path for pre-commit hook / commit.gpgSign / merge / wrong-case path on ignorecase",
+          pc[1] == "classic" and "pre-commit" in pc[2] and pcn[1] == "fast"
+          and gpg[1] == "classic" and "gpgSign" in gpg[2] and gpg[0] == 1
+          and mh[1] == "classic" and "MERGE_HEAD" in mh[2] and ci[1] == "classic" and "case" in ci[2],
+          repr((pc, pcn, gpg, mh, ci)))
+    sh(["git", "checkout", "-q", "--", "."], repo, dict(env, GIT_LITERAL_PATHSPECS="0"))
+
+    # the only file of a directory deleted, PATH = that file: the directory must go
+    # too (git stores no empty trees)
+    write(repo, "mine/solo/deep/only.txt", "o\n")
+    sh(["git", "add", "mine/solo/deep/only.txt"], repo, env)
+    sh(["git", "commit", "-q", "-m", "solo", "--", "mine/solo/deep/only.txt"], repo, env)
+    os.remove(os.path.join(repo, "mine/solo/deep/only.txt"))
+    r = gq(repo, env, "commit", "-q", "-m", "solo-gone", "--", "mine/solo/deep/only.txt")
+    left = sh(["git", "ls-tree", "HEAD", "--", "mine/solo"], repo, env).stdout.strip()
+    check("fast: deleting a directory's only file removes the emptied directories from the tree",
+          r.returncode == 0 and left == "" and sh(["git", "fsck", "--no-dangling", "--no-progress"], repo, env,
+                                                   check_rc=False).returncode == 0, repr((r.returncode, left)))
+
+    # unborn branch: the first commit of a repository
+    fresh = os.path.join(tmp, "fast-unborn")
+    os.makedirs(fresh)
+    sh(["git", "init", "-q", "-b", "main"], fresh, env)
+    write(fresh, "a/x.txt", "x\n")
+    r = gq(fresh, env, "commit", "-m", "first", "--", "a")
+    gs = sh(["git", "reflog", "-1", "--format=%gs"], fresh, env, check_rc=False).stdout.strip()
+    files = sh(["git", "ls-files"], fresh, env).stdout.split()
+    check("fast: first commit on an unborn branch", r.returncode == 0 and gs == "commit (initial): first"
+          and files == ["a/x.txt"] and n_commits(fresh, env) == 1, repr((r.returncode, gs, files)))
+
+    scen_fast_oracle(tmp, env)
+    scen_fast_messages(tmp, env)
+
+
+def scen_fast_oracle(tmp, env):
+    """Random edits under several directories, plus staged states git treats
+    specially (force-added ignored files, intent-to-add, `rm --cached`). Before each
+    wombat-gate commit the repository is copied and the copy runs the real thing,
+    `git add -A -- PATHS && git commit -- PATHS`. Commit tree and index entries under
+    PATHS must match; a foreign staged file must stay staged."""
+    import random
+    rnd = random.Random(1005)
+    repo = make_repo(os.path.join(tmp, "fast-oracle"), env, 30)
+    dirs = ["A", "A/sub", "A/sub/deep", "B", "C d", "ü", "[x]", "E"]
+    names = ["f1.txt", "f 2.txt", "[k].md", "g.py", "x.log"]
+    write(repo, ".gitignore", "*.log\n")
+    for d in dirs:
+        write(repo, d + "/" + names[0], d + "\n")
+    write(repo, "Z/foreign.txt", "z0\n")
+    sh(["git", "add", "--all", "--", ".gitignore", "A", "B", "C d", "ü", "[x]", "E", "Z"], repo, env)
+    sh(["git", "commit", "-q", "-m", "seed"], repo, env)
+    write(repo, "Z/foreign.txt", "z-staged\n")
+    sh(["git", "add", "Z/foreign.txt"], repo, env)  # someone else's staging, must survive
+    lit = dict(env, GIT_LITERAL_PATHSPECS="1")
+    bad, n_commit, n_nothing, n_special, n_refused = [], 0, 0, 0, 0
+    for rnd_i in range(30):
+        for _ in range(rnd.randint(1, 6)):
+            d = rnd.choice(dirs)
+            p = os.path.join(repo, d, rnd.choice(names))
+            rel = os.path.relpath(p, repo)
+            op = rnd.random()
+            if op < 0.35:
+                write(repo, rel, "%d %f\n" % (rnd_i, rnd.random()))
+            elif op < 0.5 and os.path.exists(p):
+                os.remove(p)
+            elif op < 0.57:
+                shutil.rmtree(os.path.join(repo, d), ignore_errors=True)  # whole dir gone
+            elif op < 0.65 and os.path.isfile(p):
+                os.chmod(p, os.stat(p).st_mode ^ 0o111)
+            elif op < 0.72:
+                write(repo, d + "/x.log", "forced %d\n" % rnd_i)  # ignored, force-added
+                sh(["git", "add", "-f", "--", d + "/x.log"], repo, lit)
+                n_special += 1
+            elif op < 0.79 and not os.path.exists(p):
+                write(repo, rel, "ita %d\n" % rnd_i)
+                sh(["git", "add", "-N", "--", rel], repo, lit)  # intent-to-add
+                n_special += 1
+            elif op < 0.86 and os.path.isfile(p) and sh(["git", "ls-files", "--", rel], repo, lit).stdout.strip():
+                sh(["git", "rm", "-q", "--cached", "--", rel], repo, lit)  # untracked again, file stays
+                n_special += 1
+            elif not os.path.lexists(p + ".lnk"):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                os.symlink("target-%d" % rnd_i, p + ".lnk")
+        cands = list(dirs) + sh(["git", "ls-files", "--", "A", "B", "E"], repo, env).stdout.split("\n")
+        cands = [c for c in cands if c and (os.path.lexists(os.path.join(repo, c)) or
+                 sh(["git", "ls-tree", "--name-only", "HEAD", "--", c], repo, lit).stdout.strip())]
+        rels = sorted(set(rnd.sample(cands, min(len(cands), rnd.randint(1, 3)))))
+        rels = [r for r in rels if not any(r.startswith(o + "/") for o in rels)]
+        # the oracle: real git on a copy
+        ocopy = os.path.join(tmp, "fast-oracle-copy")
+        shutil.rmtree(ocopy, ignore_errors=True)
+        shutil.copytree(repo, ocopy, symlinks=True)
+        base = sh(["git", "rev-parse", "HEAD^{tree}"], repo, env).stdout.strip()
+        pre_idx = sh(["git", "ls-files", "-s", "--"] + rels, ocopy, lit).stdout
+        oa = sh(["git", "add", "--all", "--"] + rels, ocopy, lit, check_rc=False)
+        staged = sh(["git", "diff", "--cached", "--quiet", "HEAD", "--"] + rels, ocopy, lit, check_rc=False).returncode
+        oc = sh(["git", "commit", "-q", "-m", "o", "--"] + rels, ocopy, lit, check_rc=False) if staged else None
+        expect = sh(["git", "rev-parse", "HEAD^{tree}"], ocopy, env).stdout.strip()
+        refused = oa.returncode != 0 or (oc is not None and oc.returncode != 0)
+        expect_idx = pre_idx if refused else sh(["git", "ls-files", "-s", "--"] + rels, ocopy, lit).stdout
+        cwd, args = repo, list(rels)
+        if rnd_i % 5 == 4:  # from a subdirectory, with '..'
+            os.makedirs(os.path.join(repo, "E"), exist_ok=True)
+            cwd, args = os.path.join(repo, "E"), [os.path.join("..", r) for r in rels]
+        r = subprocess.run([sys.executable, TOOL, "commit", "-q", "-m", "r%d" % rnd_i, "--"] + args,
+                           cwd=cwd, env=env, text=True, capture_output=True)
+        got = sh(["git", "rev-parse", "HEAD^{tree}"], repo, env).stdout.strip()
+        got_idx = sh(["git", "ls-files", "-s", "--"] + rels, repo, lit).stdout
+        if refused:  # git refused (e.g. a path known nowhere): so must we, changing nothing
+            n_refused += 1
+            ok = r.returncode == 1 and got == base
+        elif not staged:
+            n_nothing += 1
+            ok = r.returncode == 3 and got == base
+        else:
+            n_commit += 1
+            ok = r.returncode == 0 and got == expect
+        foreign = sh(["git", "diff", "--cached", "--name-only", "--", "Z"], repo, env).stdout.split()
+        if not ok or got_idx != expect_idx or foreign != ["Z/foreign.txt"]:
+            lg = set(sh(["git", "ls-tree", "-r", "HEAD"], repo, env).stdout.splitlines())
+            le = set(sh(["git", "ls-tree", "-r", "HEAD"], ocopy, env).stdout.splitlines())
+            bad.append((rnd_i, rels, r.returncode, r.stderr.strip()[-150:], ok, got_idx == expect_idx, foreign,
+                        sorted(lg - le)[:3], sorted(le - lg)[:3]))
+            if len(bad) > 3:
+                break
+    shutil.rmtree(os.path.join(tmp, "fast-oracle-copy"), ignore_errors=True)
+    check("fast oracle: commit tree = real git commit -- PATHS (%d commits, %d nothing, %d refused, %d special stagings)"
+          % (n_commit, n_nothing, n_refused, n_special), not [b for b in bad if not b[4]] and n_commit >= 15 and n_special >= 5,
+          repr(bad[:2]))
+    check("fast oracle: index under PATHS = real git's, foreign staging kept",
+          not bad and n_commit >= 15, repr(bad[:2]))
+
+
+def scen_fast_messages(tmp, env):
+    """Same change + same message through classic (git commit) and fast: identical
+    message bytes, tree and identity, also with commit.cleanup=strip."""
+    base = make_repo(os.path.join(tmp, "msg-base"), env, 5)
+    clones = {}
+    for m in ("classic", "fast"):
+        clones[m] = os.path.join(tmp, "msg-" + m)
+        sh(["git", "clone", "-q", base, clones[m]], tmp, env)
+    msgfile = os.path.join(tmp, "msg-file.txt")
+    with open(msgfile, "w") as f:
+        f.write("\n\nfrom file  \n\n\n# kept unless strip\nlast\n\n")
+    cases = [["-m", "  subject  \n\n\nbody line   \n# hash line\n\n\n"], ["-m", "only"],
+             ["-m", "a", "-m", "b\n\n\n"], ["-F", msgfile], ["cleanup=strip", "-m", "# c\nsubj\n# d\n"]]
+    diffs = []
+    for i, case in enumerate(cases):
+        out = {}
+        for m, repo in clones.items():
+            argv = list(case)
+            if argv[0] == "cleanup=strip":
+                sh(["git", "config", "commit.cleanup", "strip"], repo, env)
+                argv = argv[1:]
+            write(repo, "m/n.txt", "%d\n" % i)
+            r = gq(repo, dict(env, WOMBAT_COMMIT_MODE=m), "commit", *argv, "--", "m")
+            out[m] = (r.returncode, sh(["git", "log", "-1", "--format=%B|%T|%an|%ae|%cn|%ce"], repo, env).stdout)
+        if out["classic"][0] != 0 or out["classic"] != out["fast"]:
+            diffs.append((i, out))
+    check("fast: message parity with git commit (%d cases incl. -F, -m -m, cleanup=strip)" % len(cases),
+          not diffs, repr(diffs[:1]))
+
+
+def scen_fast_review2(tmp, env):
+    """Verifier findings on 0.6 (N1 racy entries, N2 signals, N4 non-UTF-8 names,
+    N5 unmerged entry elsewhere, invalid commit.cleanup)."""
+    env = dict(env, WOMBAT_COMMIT_MODE="fast")
+    state = env["WOMBAT_STATE_DIR"]
+
+    # N1: a racily-clean entry (file rewritten within the index's timestamp tick,
+    # same size) must be re-read, as git does; 0.6-draft committed the old content
+    repo = make_repo(os.path.join(tmp, "racy"), env, 5)
+    sh(["git", "config", "core.trustctime", "false"], repo, env)
+    f = os.path.join(repo, "d", "f")
+    write(repo, "d/f", "aaaa\n")
+    sh(["git", "add", "d/f"], repo, env)
+    st = os.stat(f)
+    write(repo, "d/f", "bbbb\n")
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.utime(os.path.join(repo, ".git", "index"), ns=(st.st_atime_ns, st.st_mtime_ns))
+    time.sleep(1.1)
+    r = gq(repo, env, "commit", "-q", "-m", "racy", "--", "d")
+    got = sh(["git", "show", "HEAD:d/f"], repo, env, check_rc=False).stdout
+    check("fast: racily-clean file is re-read (commits what is on disk)",
+          r.returncode == 0 and got == "bbbb\n", repr((r.returncode, got)))
+
+    # N2: SIGTERM while we hold index.lock -> lock removed, nothing committed
+    repo = make_repo(os.path.join(tmp, "sigterm"), env, 5)
+    hk = os.path.join(repo, ".git", "hooks", "commit-msg")
+    with open(hk, "w") as fh:
+        fh.write("#!/bin/sh\nsleep 5\n")
+    os.chmod(hk, 0o755)
+    write(repo, "d/x", "x\n")
+    head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
+    p = subprocess.Popen([sys.executable, TOOL, "commit", "-m", "t", "--", "d"], cwd=repo, env=env,
+                         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lock = os.path.join(repo, ".git", "index.lock")
+    deadline = time.time() + 10
+    while time.time() < deadline and not os.path.exists(lock):
+        time.sleep(0.05)
+    held = os.path.exists(lock)
+    time.sleep(0.5)
+    p.send_signal(signal.SIGTERM)
+    o, e = p.communicate(timeout=30)
+    left = os.path.exists(lock)
+    same = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip() == head
+    check("fast: SIGTERM while holding index.lock -> lock removed, exit 143, nothing committed",
+          held and p.returncode == 143 and not left and same and read_log(state)[-1].get("result") == "signalled",
+          repr((held, p.returncode, left, same, e[-120:])))
+
+    # N4: a non-UTF-8 file name elsewhere in the tree must not break the graft
+    repo = make_repo(os.path.join(tmp, "nonutf8"), env, 5)
+    bad = os.path.join(repo.encode(), b"bad\xffname")
+    with open(bad, "wb") as fh:
+        fh.write(b"x\n")
+    subprocess.run([b"git", b"add", b"--", b"bad\xffname"], cwd=repo, env=env, check=True)
+    sh(["git", "commit", "-q", "-m", "bad name"], repo, env)
+    write(repo, "d/a", "2\n")
+    r = gq(repo, env, "commit", "-q", "-m", "m", "--", "d")
+    still = subprocess.run([b"git", b"ls-files", b"-z"], cwd=repo, env=env, stdout=subprocess.PIPE).stdout
+    check("fast: a non-UTF-8 file name elsewhere in the tree does not break the commit",
+          r.returncode == 0 and b"bad\xffname" in still and read_log(state)[-1].get("mode") == "fast",
+          repr((r.returncode, r.stderr[-120:])))
+
+    # N5: an unmerged entry outside PATH (no merge in progress) -> classic path, commit lands
+    repo = make_repo(os.path.join(tmp, "unmerged"), env, 5)
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, env=env, input="c\n", text=True,
+                          stdout=subprocess.PIPE).stdout.strip()
+    info = "".join("100644 %s %d\to/c\n" % (blob, k) for k in (1, 2, 3))
+    subprocess.run(["git", "update-index", "--index-info"], cwd=repo, env=env, input=info, text=True, check=True)
+    write(repo, "d/a", "a\n")
+    r = gq(repo, env, "commit", "-q", "-m", "u", "--", "d")
+    last = read_log(state)[-1]
+    check("fast: unmerged entry outside PATH -> classic path, commit lands",
+          r.returncode == 0 and last.get("mode") == "classic" and "write-tree" in last.get("classic_reason", "")
+          and subj(repo, env) == "u", repr((r.returncode, last.get("mode"), last.get("classic_reason"))))
+
+    # invalid commit.cleanup: git refuses, so must we
+    repo = make_repo(os.path.join(tmp, "cleanup"), env, 5)
+    sh(["git", "config", "commit.cleanup", "bogus"], repo, env)
+    write(repo, "d/a", "a\n")
+    head = sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
+    r = gq(repo, env, "commit", "-q", "-m", "c", "--", "d")
+    check("fast: invalid commit.cleanup -> exit 1, nothing committed, lock removed",
+          r.returncode == 1 and "Invalid cleanup mode" in r.stderr
+          and sh(["git", "rev-parse", "HEAD"], repo, env).stdout.strip() == head
+          and not os.path.exists(os.path.join(repo, ".git", "index.lock")), repr((r.returncode, r.stderr[-100:])))
+
+
+def scen_head_unreadable(tmp, env):
+    """Classic path: commit fails, then HEAD cannot be read (silently). 0.5 called that
+    'HEAD moved', blamed a foreign commit and retried / left the index alone."""
+    env = dict(env, WOMBAT_COMMIT_MODE="classic")
+    repo = make_repo(os.path.join(tmp, "headfail"), env, 5)
+    # two shims in a chain: commit shim -> rev-parse shim -> git
+    es, _ = shim_git(tmp, env, "hc", '*" rev-parse --verify -q HEAD "*', "exit 1", at=(2, 3, 4, 5, 6))
+    es, _ = shim_git(tmp, es, "hc2", '*" commit "*',
+                     "echo \"fatal: Unable to create '$PWD/.git/index.lock': File exists.\" >&2; exit 128",
+                     real_git=os.path.join(tmp, "fshim-hc", "git"))
+    es["WOMBAT_GIT_RETRIES"] = "0"
+    write(repo, "mine/x.txt", "x\n")
+    r = gq(repo, es, "commit", "-m", "own-x", "--", "mine")
+    last = read_log(env["WOMBAT_STATE_DIR"])[-1]
+    check("classic: HEAD unreadable after a failed commit -> exit 1, not 'HEAD moved'",
+          r.returncode == 1 and last.get("result") == "head_unreadable" and "HEAD moved" not in r.stderr
+          and n_commits(repo, env) == 1, repr((r.returncode, last.get("result"), r.stderr[-150:])))
+
+
 # Mutation check (--mutants): re-introduce a past bug into a copy of the tool or
 # of the guard hook and confirm that the check written for it goes red, while the
 # unmodified originals pass. Entries:
@@ -728,11 +1222,11 @@ MUTANTS = [
      'elif p.startswith(":"):', 'elif False:',
      "guard: ':!x'"),
     ("tool", "index restore: plain reset instead of the snapshot",
-     "    if head_sha() != head0:\n        eprint(",
-     "    git([\"reset\", \"-q\", \"--\"] + paths, env_extra=lit)\n    return\n    if head_sha() != head0:\n        eprint(",
+     "    if head_after(head0) != head0:\n        eprint(",
+     "    git([\"reset\", \"-q\", \"--\"] + paths, env_extra=lit)\n    return\n    if head_after(head0) != head0:\n        eprint(",
      "failed commit puts the index back exactly"),
     ("tool", "index restore: no HEAD-moved guard",
-     "    if head_sha() != head0:\n        eprint(", "    if False:\n        eprint(",
+     "    if head_after(head0) != head0:\n        eprint(", "    if False:\n        eprint(",
      "commit fails after a foreign commit took part"),
     ("tool", "swept detection looks only at the index",
      'if st.returncode == 0 and not st.stdout.strip():',
@@ -753,11 +1247,69 @@ MUTANTS = [
      '    return None\n    longs, shorts = RUN_DENY.get(sub, ([], ""))',
      "state-rewriting argument forms refused"),
     ("tool", "file list taken before the commit",
-     "            if dt.returncode == 0:", "            if False:",
+     "        if dt.returncode == 0:", "        if False:",
      "reported file list = files in our commit"),
     ("tool", "add step not timed",
      'env_extra=lit, step="add")', "env_extra=lit)",
      "log: per-step timings"),
+    ("tool", "fast: update-ref without the old value (no compare-and-swap)",
+     '"HEAD", new, head or ""]', '"HEAD", new]',
+     "fast: HEAD moved before our update-ref"),
+    ("tool", "fast: empty directories kept in the graft",
+     "                entries.pop(name, None)  # git keeps no empty directories",
+     '                entries[name] = "040000 tree " + EMPTY_TREE',
+     "fast: deleting a directory's only file"),
+    ("tool", "fast: shared index not rewritten after the commit",
+     "        os.replace(self.path, self.index)", "        os.remove(self.path)",
+     "fast oracle: index under PATHS"),
+    ("tool", "fast: private index built from scratch, not from the shared index",
+     '            shutil.copy2(gp["index"], idx)', "            pass",
+     "fast oracle: commit tree"),
+    ("tool", "fast: index.lock not held (review 0.6 #1)",
+     "                    self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)",
+     "                    self.fd = os.open(os.devnull, os.O_RDWR)",
+     "fast: a bare git commit during ours is locked out"),
+    ("tool", "fast: hooks do not get the private index",
+     '    if index:\n        env["GIT_INDEX_FILE"] = index', '    if False:\n        env["GIT_INDEX_FILE"] = index',
+     "fast: hooks -- prepare-commit-msg"),
+    ("tool", "fast: message not cleaned up like git commit",
+     '    if mode == "verbatim":\n        return msg', '    if True:\n        return msg',
+     "fast: message parity"),
+    ("tool", "fast: commit.gpgSign does not force the classic path",
+     '("commit.gpgsign", "commit.gpgSign (commit-tree would not sign)")', '("commit.nosuchkey", "x")',
+     "fast: classic path for pre-commit hook"),
+    ("tool", "fast: wrong-case path not detected on ignorecase",
+     '    if cfg_bool(cfg.get("core.ignorecase"), False):', "    if False:",
+     "fast: classic path for pre-commit hook"),
+    ("tool", "fast: pre-commit hook does not force the classic path",
+     '    if not args.no_verify and hook_file(gp, "pre-commit"):', '    if False:',
+     "fast: classic path for pre-commit hook"),
+    ("tool", "fast: a path known nowhere is skipped instead of refused",
+     "            if gone:  # checked only when there is something to commit",
+     "            if False:  # checked only when there is something to commit",
+     "fast oracle: commit tree"),
+    ("tool", "fast: index copied without its mtime (racy entries look clean)",
+     "            shutil.copy2(gp[\"index\"], idx)", "            shutil.copyfile(gp[\"index\"], idx)",
+     "fast: racily-clean file is re-read"),
+    ("tool", "fast: no signal handlers while holding index.lock",
+     "CATCH_SIGNALS = [getattr(signal, n) for n in (\"SIGTERM\", \"SIGHUP\", \"SIGQUIT\") if hasattr(signal, n)]",
+     "CATCH_SIGNALS = []",
+     "fast: SIGTERM while holding index.lock"),
+    ("tool", "git output decoded strictly (non-UTF-8 names crash)",
+     'text=True, errors="surrogateescape", input=input,', 'text=True, input=input,',
+     "fast: a non-UTF-8 file name"),
+    ("tool", "fast: write-tree failure is an error instead of a classic fallback",
+     "            return FALLBACK", "            raise GitStepFailed(part, \"write_tree\")",
+     "fast: unmerged entry outside PATH"),
+    ("tool", "fast: invalid commit.cleanup accepted",
+     '        raise RuntimeError("Invalid cleanup mode %s" % cleanup)', "        pass",
+     "fast: invalid commit.cleanup"),
+    ("tool", "HEAD read error taken for an unborn branch",
+     "    if (r.stderr or \"\").strip():\n        raise HeadUnreadable", "    if False:\n        raise HeadUnreadable",
+     "fast: HEAD unreadable at start"),
+    ("tool", "HEAD that reads as missing taken for 'HEAD moved'",
+     "    if h is None and head0 is not None:", "    if False:",
+     "classic: HEAD unreadable after a failed commit"),
     ("guard", "guard: env -i not recognised",
      '                if ch == "i":', '                if False:',
      "env -i PATH=/usr/bin"),
@@ -877,7 +1429,11 @@ def main():
         scen_mutation(tmp, env, a.writers, a.commits, a.files)
         scen_queue(tmp, env, a.writers, a.commits, a.files)
         scen_mixed(tmp, env, a.writers, a.commits, a.files)
-        scen_single(tmp, env)
+        scen_single(tmp, env, "classic")
+        scen_single(tmp, env, "fast")
+        scen_fast(tmp, env)
+        scen_fast_review2(tmp, env)
+        scen_head_unreadable(tmp, env)
     finally:
         if not a.keep:
             shutil.rmtree(tmp, ignore_errors=True)

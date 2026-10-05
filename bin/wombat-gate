@@ -29,13 +29,14 @@ import os
 import random
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 EXIT_OK = 0
 EXIT_GIT_ERROR = 1
@@ -43,6 +44,7 @@ EXIT_USAGE = 2
 EXIT_NOTHING = 3          # nothing to commit in the given paths
 EXIT_LOCK_TIMEOUT = 4     # could not get the wombat-gate queue lock in time
 EXIT_GIT_LOCK_BUSY = 5    # a foreign git process kept a git lock past all retries
+EXIT_INDEX_STALE = 6      # committed, but the shared index could not be updated for the paths
 
 # The one message git prints when another process holds one of its lock files
 # (index.lock, HEAD.lock, refs/.../x.lock, config.lock all use it). Anything else
@@ -133,7 +135,8 @@ def git(argv, cwd=None, env_extra=None, capture=True, input=None):
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(["git"] + argv, cwd=cwd, env=env, text=True, input=input,
+    # surrogateescape: file names are bytes; a non-UTF-8 one must round-trip, not crash
+    return subprocess.run(["git"] + argv, cwd=cwd, env=env, text=True, errors="surrogateescape", input=input,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None)
 
@@ -165,7 +168,7 @@ def write_log(rec):
     rec.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     line = json.dumps(rec, ensure_ascii=False, sort_keys=False)
     # O_APPEND writes of one short line are atomic enough on a local fs.
-    with open(log_path(), "a", encoding="utf-8") as f:
+    with open(log_path(), "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(line + "\n")
 
 
@@ -479,97 +482,618 @@ def cmd_commit(args):
         return finish(rec, EXIT_LOCK_TIMEOUT)
     try:
         rec["wait_s"], rec["t_acq"] = lk.wait_s, time.time()
-        # 0) remember the index entries under the paths, to put them back on failure
-        snap = git_retry(["ls-files", "-s", "-z", "--full-name", "--"] + args.paths, rec, env_extra=lit, step="snapshot")
-        if snap.returncode != 0:
-            eprint(snap.stderr.rstrip())
-            rec["result"] = "snapshot_failed"
-            return finish_locked(rec, lk, t0, fail_rc(snap))
-        snap, head0 = snap.stdout, head_sha()
-        # 1) stage only the named paths (adds, modifications and deletions under them)
-        r = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="add")
-        if r.returncode != 0:
-            eprint(r.stderr.rstrip())
-            rec["result"] = "add_failed"
-            timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
-            return finish_locked(rec, lk, t0, fail_rc(r))
-        # 2) anything to commit under those paths? (index vs HEAD, path-limited)
-        # --no-renames: we only need the list; rename detection cost 7 of 8 s on a slow mount
-        r = git_retry(["diff", "--cached", "--no-renames", "--name-status", "--"] + args.paths, rec, env_extra=lit, step="diff")
-        if r.returncode != 0:
-            eprint(r.stderr.rstrip())
-            rec["result"] = "diff_failed"
-            timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
-            return finish_locked(rec, lk, t0, fail_rc(r))
-        changed = [l for l in r.stdout.splitlines() if l.strip()]
-        if not changed:
-            eprint("wombat-gate: nothing to commit under", " ".join(args.paths))
-            rec["result"] = "nothing"
-            return finish_locked(rec, lk, t0, EXIT_NOTHING)
-        rec["n_files"] = len(changed)
-        # 3) commit only those paths; other staged entries in the index stay staged.
-        # A lock collision makes git fail before it writes anything, so a plain retry
-        # is safe. (0.2 treated "HEAD moved" as "our commit landed"; HEAD usually
-        # moves because the *other* process committed, so that was wrong.)
-        argv = ["commit", "-F", "-"] + (["--no-verify"] if args.no_verify else []) + ["--"] + args.paths
-        r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
-        if r.returncode != 0 and head_sha() != head0:
-            # A foreign (non-wombat-gate) process committed meanwhile. Either its bare
-            # `git commit` took our staged paths, or its index write dropped our
-            # staging. Only the *working tree* tells these apart: if nothing under
-            # our paths differs from HEAD (tracked or untracked), our changes are in
-            # HEAD; otherwise stage and commit once more from scratch.
-            st = timed(rec, "swept_check", git,
-                       ["status", "--porcelain", "--no-renames", "--untracked-files=all", "--"] + args.paths,
-                       env_extra=dict(lit, GIT_OPTIONAL_LOCKS="0"))
-            if st.returncode == 0 and not st.stdout.strip():
-                head_now = head_sha() or "?"
-                eprint("wombat-gate: your changes under %s were already committed by another "
-                       "process (HEAD is now %s, not made by wombat-gate); nothing left to commit"
-                       % (" ".join(args.paths), head_now[:12]))
-                rec.update(result="swept_by_foreign", foreign_head=head_now[:12])
-                return finish_locked(rec, lk, t0, EXIT_NOTHING)
-            rec["redo"] = 1
-            ra = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="redo_add")
-            if ra.returncode != 0:
-                eprint(ra.stderr.rstrip())
-                rec["result"] = "redo_add_failed"
-                timed(rec, "restore", restore_index, snap, head0, args.paths, lit)  # HEAD moved: warns, leaves index
-                return finish_locked(rec, lk, t0, fail_rc(ra))
-            r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
-        if r.returncode != 0:
-            eprint((r.stdout or "").rstrip())
-            eprint(r.stderr.rstrip())
-            rec["result"] = "commit_failed"
-            # leave the shared index as we found it for these paths
-            timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
-            return finish_locked(rec, lk, t0, fail_rc(r))
-        # Our sha comes from git's own output, not from HEAD (which a foreign
-        # process may have moved already).
-        m = re.search(r"^\[[^\]]* ([0-9a-f]{7,40})\]", r.stdout or "", re.M)
-        sha = m.group(1) if m else None
-        rec.update(result="committed", commit=sha)
-        if sha is None:
-            rec["result"] = "committed_sha_unknown"
-            eprint("wombat-gate: warning: commit succeeded but its sha was not found in git's output")
-        else:
-            # what actually went into the commit (a foreign commit may have taken
-            # some of the files diffed before committing)
-            dt = timed(rec, "diff_tree", git, ["diff-tree", "--no-commit-id", "--name-status", "-r", "--root", sha])
-            if dt.returncode == 0:
-                changed = [l for l in dt.stdout.splitlines() if l.strip()]
-                rec["n_files"] = len(changed)
-        if not args.quiet:
-            print("wombat-gate: committed %s (%d file%s)" % (sha or "?", len(changed), "" if len(changed) == 1 else "s"))
-            print("\n".join(changed))
-        return finish_locked(rec, lk, t0, EXIT_OK)
+        try:
+            why_classic, gp, cfg = classic_reason(args, top)
+            if why_classic is None:
+                rec["mode"] = "fast"
+                rc = fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg)
+                if rc is not FALLBACK:
+                    return rc
+                rec["mode"] = "classic"  # classic_reason was set by fast_commit
+                return classic_commit(args, lit, msg, rec, lk, t0)
+            rec.update(mode="classic", classic_reason=why_classic)
+            return classic_commit(args, lit, msg, rec, lk, t0)
+        except HeadUnreadable as e:
+            # 0.5 read a failed `rev-parse HEAD` as "HEAD moved" and blamed a foreign
+            # commit (seen twice on 10-05 while the 9p mount was failing)
+            eprint("wombat-gate: cannot read HEAD (%s). The repository may sit on a failing mount; "
+                   "nothing was assumed about other processes. Check `wombat-gate status -- %s` "
+                   "once the disk is readable." % (e, " ".join(args.paths)))
+            rec["result"] = "head_unreadable"
+            return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
     finally:
         lk.__exit__(None, None, None)
 
 
-def head_sha():
-    r = git(["rev-parse", "--verify", "-q", "HEAD"])
-    return r.stdout.strip() if r.returncode == 0 else None
+def classic_commit(args, lit, msg, rec, lk, t0):
+    """0.5 path: `git add -A -- PATH` + `git commit -- PATH` on the shared index."""
+    # 0) remember the index entries under the paths, to put them back on failure
+    snap = git_retry(["ls-files", "-s", "-z", "--full-name", "--"] + args.paths, rec, env_extra=lit, step="snapshot")
+    if snap.returncode != 0:
+        eprint(snap.stderr.rstrip())
+        rec["result"] = "snapshot_failed"
+        return finish_locked(rec, lk, t0, fail_rc(snap))
+    snap, head0 = snap.stdout, head_sha()  # None only for an unborn branch
+    # 1) stage only the named paths (adds, modifications and deletions under them)
+    r = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="add")
+    if r.returncode != 0:
+        eprint(r.stderr.rstrip())
+        rec["result"] = "add_failed"
+        timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+        return finish_locked(rec, lk, t0, fail_rc(r))
+    # 2) anything to commit under those paths? (index vs HEAD, path-limited)
+    # --no-renames: we only need the list; rename detection cost 7 of 8 s on a slow mount
+    r = git_retry(["diff", "--cached", "--no-renames", "--name-status", "--"] + args.paths, rec, env_extra=lit, step="diff")
+    if r.returncode != 0:
+        eprint(r.stderr.rstrip())
+        rec["result"] = "diff_failed"
+        timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+        return finish_locked(rec, lk, t0, fail_rc(r))
+    changed = [l for l in r.stdout.splitlines() if l.strip()]
+    if not changed:
+        eprint("wombat-gate: nothing to commit under", " ".join(args.paths))
+        rec["result"] = "nothing"
+        return finish_locked(rec, lk, t0, EXIT_NOTHING)
+    rec["n_files"] = len(changed)
+    # 3) commit only those paths; other staged entries in the index stay staged.
+    # A lock collision makes git fail before it writes anything, so a plain retry
+    # is safe. (0.2 treated "HEAD moved" as "our commit landed"; HEAD usually
+    # moves because the *other* process committed, so that was wrong.)
+    argv = ["commit", "-F", "-"] + (["--no-verify"] if args.no_verify else []) + ["--"] + args.paths
+    r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
+    if r.returncode != 0 and head_after(head0) != head0:
+        # A foreign (non-wombat-gate) process committed meanwhile. Either its bare
+        # `git commit` took our staged paths, or its index write dropped our
+        # staging. Only the *working tree* tells these apart: if nothing under
+        # our paths differs from HEAD (tracked or untracked), our changes are in
+        # HEAD; otherwise stage and commit once more from scratch.
+        st = timed(rec, "swept_check", git,
+                   ["status", "--porcelain", "--no-renames", "--untracked-files=all", "--"] + args.paths,
+                   env_extra=dict(lit, GIT_OPTIONAL_LOCKS="0"))
+        if st.returncode == 0 and not st.stdout.strip():
+            head_now = head_after(head0) or "?"
+            eprint("wombat-gate: your changes under %s were already committed by another "
+                   "process (HEAD is now %s, not made by wombat-gate); nothing left to commit"
+                   % (" ".join(args.paths), head_now[:12]))
+            rec.update(result="swept_by_foreign", foreign_head=head_now[:12])
+            return finish_locked(rec, lk, t0, EXIT_NOTHING)
+        rec["redo"] = 1
+        ra = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="redo_add")
+        if ra.returncode != 0:
+            eprint(ra.stderr.rstrip())
+            rec["result"] = "redo_add_failed"
+            timed(rec, "restore", restore_index, snap, head0, args.paths, lit)  # HEAD moved: warns, leaves index
+            return finish_locked(rec, lk, t0, fail_rc(ra))
+        r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
+    if r.returncode != 0:
+        eprint((r.stdout or "").rstrip())
+        eprint(r.stderr.rstrip())
+        rec["result"] = "commit_failed"
+        # leave the shared index as we found it for these paths
+        timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+        return finish_locked(rec, lk, t0, fail_rc(r))
+    # Our sha comes from git's own output, not from HEAD (which a foreign
+    # process may have moved already).
+    m = re.search(r"^\[[^\]]* ([0-9a-f]{7,40})\]", r.stdout or "", re.M)
+    sha = m.group(1) if m else None
+    rec.update(result="committed", commit=sha)
+    if sha is None:
+        rec["result"] = "committed_sha_unknown"
+        eprint("wombat-gate: warning: commit succeeded but its sha was not found in git's output")
+    else:
+        # what actually went into the commit (a foreign commit may have taken
+        # some of the files diffed before committing)
+        dt = timed(rec, "diff_tree", git, ["diff-tree", "--no-commit-id", "--name-status", "-r", "--root", sha])
+        if dt.returncode == 0:
+            changed = [l for l in dt.stdout.splitlines() if l.strip()]
+            rec["n_files"] = len(changed)
+    if not args.quiet:
+        print("wombat-gate: committed %s (%d file%s)" % (sha or "?", len(changed), "" if len(changed) == 1 else "s"))
+        print("\n".join(changed))
+    return finish_locked(rec, lk, t0, EXIT_OK)
+
+
+class HeadUnreadable(Exception):
+    pass
+
+
+def head_sha(cwd=None):
+    """HEAD's sha, or None for an unborn branch. Any other failure (an I/O error on a
+    dying mount prints to stderr even under -q) raises HeadUnreadable."""
+    r = git(["rev-parse", "--verify", "-q", "HEAD"], cwd=cwd)
+    if r.returncode == 0:
+        return r.stdout.strip()
+    if (r.stderr or "").strip():
+        raise HeadUnreadable(r.stderr.strip().splitlines()[-1])
+    return None
+
+
+def head_after(head0, cwd=None):
+    """HEAD now. A branch that had a commit cannot become unborn again, so a None here
+    means HEAD could not be read -- not that someone moved it."""
+    h = head_sha(cwd)
+    if h is None and head0 is not None:
+        raise HeadUnreadable("HEAD was %s and now reads as missing" % head0[:12])
+    return h
+
+
+# ---------------------------------------------------------------- fast commit (0.6)
+#
+# `git commit -- PATH` refreshes the whole shared index first: one lstat() per tracked
+# file (22k files took 25-85 s on a 9p/drvfs mount, tens of thousands of 9p requests).
+# The fast path does what `git add -A -- PATH && git commit -- PATH` does, without
+# looking at the working tree outside PATH:
+#   1. take the shared index's lock the way git does (create `index.lock` with
+#      O_EXCL; back off and retry while someone else has it). From here until the
+#      end no other git process can write the index -- in particular no bare
+#      `git commit` can slip in between our ref update and our index write;
+#   2. copy the shared index to a private file on the local disk and run
+#      `git add -A -- PATH` on the copy (stat data is kept, so unchanged files are
+#      not re-read; entries staged by others, force-added files etc. stay as they are);
+#   3. `write-tree` the copy, take just PATH's entries from that tree and graft them
+#      onto HEAD's tree with `ls-tree` + `mktree`, one directory level at a time
+#      (cost ~ depth of PATH; a full `read-tree HEAD` alone took 19.5 s there);
+#   4. message hooks, `commit-tree`, then `update-ref HEAD NEW OLD` -- a compare-
+#      and-swap: if HEAD moved anyway (plumbing, another worktree), re-graft onto it;
+#   5. write the copy into `index.lock` and rename it over the index, as git does.
+#      post-commit runs after that.
+# Selftest: tree, index and message compared with real `git commit` on copies of
+# the same repository.
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+MAX_REBUILDS = 5
+CAS_FAILED = re.compile(r"but expected|reference already exists")
+GIT_PATHS = ("hooks/pre-commit", "hooks/prepare-commit-msg", "hooks/commit-msg", "hooks/post-commit",
+             "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "index")
+ADD_ALL = ["add", "--all"]
+CFG_KEYS = ("core.filemode", "core.sparsecheckout", "core.splitindex", "core.ignorecase",
+            "commit.cleanup", "commit.gpgsign")
+
+
+def git_cfg(top):
+    """The config values the fast path needs, in one call (keys lower-cased), or None."""
+    r = git(["config", "-z", "--get-regexp", "^(%s)$" % "|".join(k.replace(".", r"\.") for k in CFG_KEYS)], cwd=top)
+    if r.returncode not in (0, 1):  # 1 = none of the keys set
+        return None
+    out = {}
+    for item in (r.stdout or "").split("\0"):
+        if item:
+            k, _, v = item.partition("\n")
+            out[k.lower()] = v
+    return out
+
+
+def cfg_bool(v, default):
+    if v is None:
+        return default
+    return v.strip().lower() in ("", "true", "yes", "on", "1")  # a bare `key` means true
+
+
+def git_paths(top):
+    """Absolute paths of hooks (--git-path honours core.hooksPath), state files and
+    the index (GIT_INDEX_FILE, if the caller set it, wins -- as in git)."""
+    argv = ["rev-parse"]
+    for p in GIT_PATHS:
+        argv += ["--git-path", p]
+    r = git(argv, cwd=top)
+    lines = (r.stdout or "").splitlines()
+    if r.returncode != 0 or len(lines) != len(GIT_PATHS):
+        return None
+    out = {k: (v if os.path.isabs(v) else os.path.join(top, v)) for k, v in zip(GIT_PATHS, lines)}
+    if os.environ.get("GIT_INDEX_FILE"):
+        out["index"] = os.path.abspath(os.environ["GIT_INDEX_FILE"])
+    return out
+
+
+def hook_file(paths, name):
+    p = paths["hooks/" + name]
+    return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+
+
+def case_mismatch(top, rels, head):
+    """On a case-insensitive checkout, a path spelled with the wrong case would be
+    grafted as a second, case-duplicate entry. True if some rel is not spelled
+    exactly as on disk (or, if gone from disk, as in HEAD)."""
+    for rel in rels:
+        d = top
+        on_disk = True
+        for comp in rel.split("/"):
+            try:
+                names = os.listdir(d)
+            except OSError:
+                on_disk = False
+                break
+            if comp not in names:
+                if any(n.lower() == comp.lower() for n in names):
+                    return True
+                on_disk = False
+                break
+            d = os.path.join(d, comp)
+        if not on_disk and head:
+            r = git(["ls-tree", "--name-only", "-z", "--full-tree", head, "--", rel], cwd=top,
+                    env_extra={"GIT_LITERAL_PATHSPECS": "1"})
+            if r.returncode != 0:
+                return True
+    return False
+
+
+def classic_reason(args, top):
+    """(why this commit has to go through plain `git commit` or None, git paths, config)."""
+    mode = os.environ.get("WOMBAT_COMMIT_MODE", "fast")
+    if mode == "classic":
+        return "WOMBAT_COMMIT_MODE=classic", None, None
+    if mode != "fast":
+        eprint("wombat-gate: warning: WOMBAT_COMMIT_MODE=%r is neither fast nor classic; using fast" % mode)
+    if args.allow_broad:
+        return "--allow-broad pathspecs", None, None
+    gp, cfg = git_paths(top), git_cfg(top)
+    if gp is None or cfg is None:
+        return "git rev-parse --git-path / git config failed", None, None
+    for state in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+        if os.path.exists(gp[state]):
+            return "%s exists" % state, gp, cfg
+    if not args.no_verify and hook_file(gp, "pre-commit"):
+        return "a pre-commit hook", gp, cfg
+    for key, why in (("core.sparsecheckout", "sparse checkout"), ("core.splitindex", "split index"),
+                     ("commit.gpgsign", "commit.gpgSign (commit-tree would not sign)")):
+        if cfg_bool(cfg.get(key), False):
+            return why, gp, cfg
+    if cfg_bool(cfg.get("core.ignorecase"), False):
+        head = head_sha(top)
+        if case_mismatch(top, repo_rel_paths(args.paths, top), head):
+            return "a path spelled with different case than on disk (core.ignorecase)", gp, cfg
+    return None, gp, cfg
+
+
+def repo_rel_paths(paths, top):
+    """check_paths()-style resolution to repository-relative '/' paths, without
+    duplicates or paths inside another given path."""
+    top_real = os.path.realpath(top)
+    rels = set()
+    for p in paths:
+        ap = os.path.abspath(p)
+        rp = os.path.join(os.path.realpath(os.path.dirname(ap)), os.path.basename(ap))
+        if os.path.basename(ap) in ("", ".", ".."):
+            rp = os.path.realpath(ap)
+        rels.add(os.path.relpath(rp, top_real).replace(os.sep, "/"))
+    return sorted(r for r in rels if not any(r.startswith(o + "/") for o in rels))
+
+
+def run_hook(hook, argv, top, index=None):
+    env = dict(os.environ, GIT_EDITOR=":", GIT_LITERAL_PATHSPECS="1")
+    if index:
+        env["GIT_INDEX_FILE"] = index
+    return subprocess.run([hook] + argv, cwd=top, env=env, text=True, errors="replace",
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def show_hook_output(h):
+    sys.stdout.write(h.stdout or "")
+    sys.stdout.flush()
+    sys.stderr.write(h.stderr or "")
+    sys.stderr.flush()
+
+
+def clean_message(msg, cleanup, top):
+    """What `git commit -F` does to the message: whitespace cleanup by default (no
+    editor), comment stripping only with commit.cleanup=strip, nothing with verbatim."""
+    mode = (cleanup or "default").strip().lower()
+    if mode not in ("default", "verbatim", "whitespace", "strip", "scissors"):
+        raise RuntimeError("Invalid cleanup mode %s" % cleanup)
+    if mode == "verbatim":
+        return msg
+    r = git(["stripspace"] + (["--strip-comments"] if mode == "strip" else []), cwd=top, input=msg)
+    if r.returncode != 0:
+        raise RuntimeError("git stripspace: %s" % r.stderr.strip())
+    return r.stdout
+
+
+def split_ls(out):
+    """{path: 'mode type sha'} (ls-tree -z) or {path: 'mode sha stage'} (ls-files -s -z)."""
+    res = {}
+    for item in (out or "").split("\0"):
+        if item:
+            meta, path = item.split("\t", 1)
+            res[path] = meta
+    return res
+
+
+class GitStepFailed(Exception):
+    def __init__(self, r, step):
+        Exception.__init__(self, step)
+        self.r, self.step = r, step
+
+
+def check_step(r, step):
+    if r.returncode != 0:
+        raise GitStepFailed(r, step)
+    return r
+
+
+def graft(top, base_tree, changes):
+    """base_tree with `changes` applied -- {name: 'mode type sha' | None (delete) |
+    {nested changes}} -- written with mktree. None if the result is empty."""
+    entries = {}
+    if base_tree:
+        entries = split_ls(check_step(git(["ls-tree", "-z", "--full-tree", base_tree], cwd=top), "graft").stdout)
+    for name, ch in changes.items():
+        if isinstance(ch, dict):
+            old = (entries.get(name) or "").split()
+            new = graft(top, old[2] if len(old) == 3 and old[1] == "tree" else None, ch)
+            if new is None:
+                entries.pop(name, None)  # git keeps no empty directories
+            else:
+                entries[name] = "040000 tree " + new
+        elif ch is None:
+            entries.pop(name, None)
+        else:
+            entries[name] = ch
+    if not entries:
+        return None
+    r = check_step(git(["mktree", "-z", "--missing"], cwd=top,
+                       input="".join("%s\t%s\0" % (meta, name) for name, meta in entries.items())), "graft")
+    return r.stdout.strip()
+
+
+class IndexLock:
+    """git's own lock on the shared index: `<index>.lock` created with O_EXCL. While we
+    hold it no git process can write the index. commit() renames our new index over
+    the old one (that also releases the lock); release() removes the lock file --
+    only if it is still the file we created."""
+
+    def __init__(self, index):
+        self.index, self.path, self.fd, self.ino = index, index + ".lock", None, None
+
+    def take(self, rec):
+        tries = int(env_float("WOMBAT_GIT_RETRIES", 8))
+        delay = env_float("WOMBAT_GIT_BACKOFF", 0.5)
+        cap = env_float("WOMBAT_GIT_BACKOFF_MAX", 20)
+        t = time.monotonic()
+        try:
+            for i in range(tries + 1):
+                try:
+                    self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+                    self.ino = os.fstat(self.fd).st_ino
+                    return True
+                except FileExistsError:
+                    if i == tries:
+                        return False
+                    rec["retries"] = rec.get("retries", 0) + 1
+                    wait = min(cap, delay * (2 ** i)) * random.uniform(0.7, 1.3)
+                    eprint("wombat-gate: git lock busy (%s exists); retry %d/%d in %.1fs"
+                           % (self.path, i + 1, tries, wait))
+                    time.sleep(wait)
+        finally:
+            steps = rec.setdefault("steps", {})
+            steps["index_lock"] = steps.get("index_lock", 0.0) + time.monotonic() - t
+        return False
+
+    def mine(self):
+        try:
+            return self.ino is not None and os.stat(self.path).st_ino == self.ino
+        except OSError:
+            return False
+
+    def commit(self, new_index):
+        if not self.mine():
+            raise OSError("%s is no longer the lock file we created" % self.path)
+        st = os.stat(new_index)
+        with open(new_index, "rb") as f:
+            view = memoryview(f.read())
+        while view:  # write(2) may write less than asked (ENOSPC, quota)
+            n = os.write(self.fd, view)
+            if n <= 0:
+                raise OSError("short write to %s" % self.path)
+            view = view[n:]
+        os.fsync(self.fd)
+        os.close(self.fd)
+        self.fd = None
+        # Keep the private index's mtime: git treats an entry whose file mtime is not
+        # older than the index file as "racily clean" and re-reads it. A fresh mtime
+        # here would make such entries look clean for good (review 0.6 N1).
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(self.path, self.index)
+        self.ino = None
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.mine():
+            os.remove(self.path)
+        self.ino = None
+
+
+class Signalled(BaseException):
+    def __init__(self, signum):
+        BaseException.__init__(self, signum)
+        self.signum = signum
+
+
+def _raise_signalled(signum, frame):
+    raise Signalled(signum)
+
+
+CATCH_SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGQUIT") if hasattr(signal, n)]
+FALLBACK = object()  # fast_commit's "use the classic path after all"
+
+
+def fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg):
+    # while we hold index.lock, a SIGTERM (e.g. a tool timeout) must not leave it
+    # behind for everyone (review 0.6 N2): turn it into an exception, run `finally`
+    old_handlers = {sig: signal.signal(sig, _raise_signalled) for sig in CATCH_SIGNALS}
+    try:
+        return _fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg)
+    except Signalled as e:
+        eprint("wombat-gate: stopped by signal %d; index.lock removed%s" % (
+            e.signum, "" if rec.get("result") != "committed" else
+            " -- but commit %s had landed and the index was not written: run the same "
+            "`wombat-gate commit` again to repair it" % str(rec.get("commit"))[:12]))
+        rec["result"] = "signalled" + ("_after_commit" if rec.get("result") == "committed" else "")
+        return finish_locked(rec, lk, t0, 128 + e.signum)
+    finally:
+        for sig, h in old_handlers.items():
+            signal.signal(sig, h)
+
+
+def _fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg):
+    rels = repo_rel_paths(args.paths, top)
+    tmpd = os.path.join(state_dir(), "tmp")
+    os.makedirs(tmpd, exist_ok=True)
+    idx = os.path.join(tmpd, "index.%d" % os.getpid())
+    msgf = os.path.join(tmpd, "msg.%d" % os.getpid())
+    envt = dict(lit, GIT_INDEX_FILE=idx)
+    paths_txt = " ".join(args.paths)
+    il = IndexLock(gp["index"])
+    try:
+        if not il.take(rec):
+            eprint("wombat-gate: %s exists; gave up after %s retries; %s"
+                   % (il.path, os.environ.get("WOMBAT_GIT_RETRIES", 8),
+                      git_lock_diagnosis("'%s'" % il.path)))
+            rec["result"] = "index_locked"
+            return finish_locked(rec, lk, t0, EXIT_GIT_LOCK_BUSY)
+        # 2. private copy of the shared index (read while we hold its lock)
+        t = time.monotonic()
+        for f in (idx, idx + ".lock"):
+            if os.path.exists(f):
+                os.remove(f)
+        try:  # copy2 keeps the mtime, which git's racy-entry check depends on (N1)
+            shutil.copy2(gp["index"], idx)
+        except FileNotFoundError:
+            pass  # no index yet (fresh repository)
+        rec.setdefault("steps", {})["copy_index"] = time.monotonic() - t
+        check_step(timed(rec, "add", git, ADD_ALL + ["--"] + rels, cwd=top, env_extra=envt), "add")
+        part = timed(rec, "write_tree", git, ["write-tree"], cwd=top, env_extra=envt)
+        if part.returncode != 0:
+            # an unmerged or broken entry outside PATH: git commit -- PATH copes, a
+            # whole-index write-tree does not. Nothing has changed yet.
+            rec["classic_reason"] = "write-tree on the index copy failed: %s" % (
+                (part.stderr or "").strip().splitlines() or ["?"])[-1]
+            return FALLBACK
+        now = check_step(timed(rec, "graft", git, ["ls-tree", "-z", "--full-tree", part.stdout.strip(), "--"] + rels,
+                               cwd=top, env_extra=lit), "graft")
+        now = split_ls(now.stdout)
+        missing = [r for r in rels if r not in now]
+        gone = []
+        if missing:
+            # like `git commit -- PATH`: a path that is neither in the working tree nor
+            # in HEAD is an error, not something to skip silently
+            known = check_step(git(["ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--"] + missing,
+                                   cwd=top, env_extra=lit), "graft") if head_sha(top) else None
+            gone = [r for r in missing if r not in set(((known and known.stdout) or "").split("\0"))]
+        else:
+            gone = []
+        changes = {}
+        for rel in rels:
+            parts = rel.split("/")
+            d = changes
+            for comp in parts[:-1]:
+                d = d.setdefault(comp, {})
+            d[parts[-1]] = now.get(rel)
+
+        sha, changed, subject, head = None, [], None, None
+        for attempt in range(MAX_REBUILDS + 1):
+            # 3. graft onto HEAD (again, if HEAD moved under the compare-and-swap)
+            head = timed(rec, "head", head_sha, top) if attempt == 0 else timed(rec, "head", head_after, head, top)
+            base = None
+            if head:
+                base = check_step(timed(rec, "graft", git, ["rev-parse", "--verify", "-q", head + "^{tree}"], cwd=top),
+                                  "graft").stdout.strip()
+            root = timed(rec, "graft", graft, top, base, changes) or EMPTY_TREE
+            if root == (base or EMPTY_TREE):
+                if attempt:
+                    eprint("wombat-gate: your changes under %s were already committed by another process "
+                           "(HEAD is now %s, not made by wombat-gate); nothing left to commit" % (paths_txt, head[:12]))
+                    rec.update(result="swept_by_foreign", foreign_head=head[:12])
+                else:
+                    eprint("wombat-gate: nothing to commit under", paths_txt)
+                    rec["result"] = "nothing"
+                try:
+                    timed(rec, "write_index", il.commit, idx)  # what `git add -A -- PATH` would leave
+                except OSError as e:
+                    eprint("wombat-gate: warning: could not write the index: %s" % e)
+                return finish_locked(rec, lk, t0, EXIT_NOTHING)
+            if gone:  # checked only when there is something to commit, as the classic path does
+                eprint("error: pathspec '%s' did not match any file(s) known to git" % gone[0])
+                rec["result"] = "pathspec_unmatched"
+                return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+            if subject is None:
+                # 4. message hooks once, after we know there is something to commit
+                with open(msgf, "w", encoding="utf-8", errors="surrogateescape") as f:
+                    f.write(msg)
+                for name, argv in (("prepare-commit-msg", [msgf, "message"]), ("commit-msg", [msgf])):
+                    hook = None if (name == "commit-msg" and args.no_verify) else hook_file(gp, name)
+                    if not hook:
+                        continue
+                    h = timed(rec, "hooks", run_hook, hook, argv, top, idx)
+                    show_hook_output(h)
+                    if h.returncode != 0:
+                        rec["result"] = "hook_rejected"
+                        return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+                with open(msgf, encoding="utf-8", errors="surrogateescape") as f:
+                    cleaned = clean_message(f.read(), cfg.get("commit.cleanup"), top)
+                if not cleaned.strip():
+                    eprint("Aborting commit due to empty commit message.")
+                    rec["result"] = "empty_message"
+                    return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+                with open(msgf, "w", encoding="utf-8", errors="surrogateescape") as f:
+                    f.write(cleaned)
+                subject = cleaned.strip().splitlines()[0]
+            dt = check_step(timed(rec, "diff_tree", git, ["diff-tree", "-r", "--no-renames", "--name-status",
+                                                          base or EMPTY_TREE, root], cwd=top), "diff_tree")
+            changed = [l for l in dt.stdout.splitlines() if l.strip()]
+            ct = check_step(timed(rec, "commit_tree", git, ["commit-tree", root] + (["-p", head] if head else [])
+                                  + ["-F", msgf], cwd=top), "commit_tree")
+            new = ct.stdout.strip()
+            ur = git_retry(["update-ref", "-m", ("commit: " if head else "commit (initial): ") + subject,
+                            "HEAD", new, head or ""], rec, step="update_ref")
+            if ur.returncode == 0:
+                sha = new
+                break
+            if ur.lock_busy or not CAS_FAILED.search(ur.stderr or ""):
+                raise GitStepFailed(ur, "update_ref")
+            rec["rebuilds"] = attempt + 1  # HEAD moved without the index (plumbing / other worktree)
+        if sha is None:
+            eprint("wombat-gate: HEAD moved under us %d times in a row; nothing committed" % (MAX_REBUILDS + 1))
+            rec["result"] = "head_kept_moving"
+            return finish_locked(rec, lk, t0, EXIT_GIT_LOCK_BUSY)
+        rec.update(result="committed", commit=sha, n_files=len(changed))
+        # 5. the new index replaces the old one, like `git commit` does
+        try:
+            timed(rec, "write_index", il.commit, idx)
+        except OSError as e:
+            eprint("wombat-gate: committed %s, BUT could not write the index (%s): the index still holds the "
+                   "old entries for %s, which show up as staged changes that would undo this commit. Run the "
+                   "same `wombat-gate commit` again once the disk is writable; it repairs the index and exits 3."
+                   % (sha[:12], e, paths_txt))
+            rec["result"] = "committed_index_stale"
+            return finish_locked(rec, lk, t0, EXIT_INDEX_STALE)
+        if not args.quiet:
+            print("wombat-gate: committed %s (%d file%s)" % (sha, len(changed), "" if len(changed) == 1 else "s"))
+            print("\n".join(changed))
+        hook = hook_file(gp, "post-commit")
+        if hook:
+            sys.stdout.flush()
+            h = timed(rec, "hooks", run_hook, hook, [], top)
+            show_hook_output(h)
+        return finish_locked(rec, lk, t0, EXIT_OK)
+    except GitStepFailed as e:
+        eprint((e.r.stderr or "").rstrip())
+        rec["result"] = "%s_failed" % e.step
+        return finish_locked(rec, lk, t0, fail_rc(e.r))
+    except HeadUnreadable:
+        raise
+    except Exception as e:  # RuntimeError from our own checks, OSError, anything unexpected
+        eprint("wombat-gate: %s: %s" % (type(e).__name__, e))
+        rec["result"] = "fast_error" if rec.get("result") != "committed" else "committed_then_error"
+        return finish_locked(rec, lk, t0, EXIT_GIT_ERROR if rec["result"] == "fast_error" else EXIT_INDEX_STALE)
+    finally:
+        il.release()
+        for f in (idx, idx + ".lock", msgf):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def restore_index(snap, head0, paths, lit):
@@ -577,7 +1101,7 @@ def restore_index(snap, head0, paths, lit):
     taken before staging (so partial stagings by others survive). Working tree untouched.
     Skipped if HEAD moved since the snapshot: restoring old entries on top of a new
     HEAD would stage a revert of whatever the other process just committed."""
-    if head_sha() != head0:
+    if head_after(head0) != head0:
         eprint("wombat-gate: warning: HEAD moved during the operation (a non-wombat-gate commit?); "
                "left the index for %s as is -- check `wombat-gate status`" % " ".join(paths))
         return

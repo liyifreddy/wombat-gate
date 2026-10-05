@@ -28,7 +28,93 @@ hand (corrupting a live operation), or fall back to `git add -A`.
   session / op / pid / start time for `wombat-gate who` and for waiters' notes. It is
   informational only; the flock is the truth.
 
-**Commit = `git add -A -- P` → `git diff --cached --no-renames --name-status -- P` →
+**Fast commit (0.6, the default).** The classic commit below spends almost all
+of its time in `git commit` itself: before writing anything it refreshes the
+whole shared index, one `lstat()` per tracked file. Measured on a 22k-file
+repository on a 9p-mounted Windows drive: 25–85 s per commit, tens of thousands
+of 9p requests. With a dozen agents committing in a burst, queue waits reached
+6 minutes. A full `read-tree HEAD` into a private index is no way out either:
+19.5 s on that mount (42k loose objects, one open per tree). The fast path:
+
+1. **Take git's index lock** the way git does: `open(index.lock, O_CREAT|O_EXCL)`,
+   backing off on `EEXIST` like `git_retry`. It is held until the end, so no
+   other git process can write the index meanwhile. A first draft wrote the
+   index only after the ref update, without the lock; review pointed out that a
+   bare `git commit` in that gap would build its tree from an index still
+   holding our paths' old entries and silently revert us.
+2. **Copy the index** to a private file (local disk) and `add -A -- P` on the
+   copy. Copying instead of seeding from `HEAD` (the first draft) keeps stat data
+   (unchanged files are not re-hashed), keeps force-added ignored files and
+   intent-to-add entries under P (the draft dropped them), keeps staged mode
+   changes, and keeps everyone else's staging for the final index write.
+3. **Graft.** `write-tree` the copy, `ls-tree` it for each path in P (one call),
+   rebuild `HEAD^{tree}` bottom-up along those paths only: per directory on the
+   way, `ls-tree` one level, replace / delete the entry, `mktree -z --missing`.
+   Directories that end up empty are dropped. Cost ≈ depth × number of paths.
+   Others' staged entries elsewhere are in the copy's tree but are never
+   grafted. A path that exists nowhere (not on disk, not in HEAD) fails the
+   commit, as `git commit -- P` does — but only when there is something to
+   commit, since the classic path returns "nothing to commit" first.
+4. Graft equals `HEAD^{tree}` ⇒ exit 3 (the copy is still written back: it is
+   what `add -A -- P` leaves). Otherwise `prepare-commit-msg` / `commit-msg`
+   (`--git-path hooks/…` honours `core.hooksPath`; `GIT_INDEX_FILE` = the copy),
+   message cleanup as `git commit -F` (`stripspace`; `--strip-comments` only for
+   `commit.cleanup=strip`), `commit-tree`, `update-ref -m "commit: <subject>"
+   HEAD NEW OLD`. With the index lock held a normal `git commit` cannot move
+   HEAD, but plumbing or another worktree on the same branch can; then the CAS
+   fails (`is at X but expected Y`) and P is grafted onto the new HEAD (their
+   change kept; if it already contains ours, exit 3). Six failures in a row ⇒
+   exit 5.
+5. **Write the copy into `index.lock` and rename it over the index**, as git
+   does; then `post-commit`. If that write fails (disk error) the commit has
+   landed but the index still has the old entries (staged changes that would
+   revert it): exit 6, and running the same commit again repairs it (exit 3).
+   On every other failure the lock file is removed (only if its inode is still
+   ours) and nothing has changed. SIGTERM / SIGHUP / SIGQUIT are turned into an
+   exception for the duration, so a tool timeout does not leave `index.lock`
+   behind for every other agent (an independent verifier found 0.6-draft did).
+   The write loops until every byte is written (a short write on a full disk
+   would otherwise leave a truncated index) and checks the lock file is still
+   ours before the rename.
+
+**Timestamps (racy git).** Git re-reads an entry whose file mtime is not older
+than the index file's own mtime ("racily clean"), because a rewrite within the
+same clock tick does not change size or mtime. Copying the index with a fresh
+mtime, or writing it back with one, hides such rewrites for good: the verifier
+reproduced a commit of stale content with a clean `git status`, also across
+agents. So the copy keeps the original mtime (`copy2`), and the lock file gets
+the private index's mtime (the one `git add` judged its entries against) before
+the rename.
+
+**Unmerged entries elsewhere.** `write-tree` on the whole copy fails if any entry
+in the index is unmerged, even outside P, while `git commit -- P` copes. Nothing
+has changed at that point, so the fast path hands over to the classic one.
+
+**Bytes, not text.** File names are bytes; one non-UTF-8 name anywhere on the
+graft path crashed the first draft. git output is decoded with
+`surrogateescape`, so names round-trip unchanged.
+
+Fallbacks to the classic path: `--allow-broad` (pathspec magic cannot be
+grafted); merge / cherry-pick / revert in progress; a `pre-commit` hook (git
+shows it `HEAD` + P, our copy also holds others' staging); `commit.gpgSign`
+(`commit-tree` ignores it); sparse checkout; split index (the copy would point
+at shared-index files next to the original); and, with `core.ignorecase`, a
+path whose spelling differs from the file on disk (the graft is case-sensitive
+and would add a case-duplicate entry). `WOMBAT_COMMIT_MODE=classic` forces it.
+The log line records `mode` and `classic_reason`.
+
+How we know it is the same commit: the self-test copies the repository before
+every fast commit and runs real `git add -A -- P && git commit -- P` on the
+copy, over 30 rounds of random edits including the special staging states
+above; commit tree, index entries under P and exit status must match.
+
+**Reading `HEAD`.** 0.5 used "`rev-parse HEAD` returned nothing" both for an
+unborn branch and as "HEAD moved"; on a failing 9p mount an I/O error made it
+report a foreign commit that never happened (twice on one day). Now a failure
+with stderr output raises, and a branch that had a commit but reads as missing
+raises too; both exit 1 with "cannot read HEAD".
+
+**Classic commit = `git add -A -- P` → `git diff --cached --no-renames --name-status -- P` →
 `git commit -F - -- P`**, all inside the lock, with `GIT_LITERAL_PATHSPECS=1`.
 (`--no-renames` because rename detection was 7 of 8 s of that step on a slow
 mount and we only need the file list.) Each step's wall time is logged
@@ -141,7 +227,7 @@ an event:
   concurrent claims are serialised and the second exclusive claim on a resource
   is rejected with the current holder's name.
 
-### Interface (proposed for 0.6 — not implemented yet)
+### Interface (proposed — not implemented yet)
 
 ```
 wombat-gate lease claim   KIND NAME [--ttl 4h] [--shared] [--note TEXT]
@@ -161,9 +247,9 @@ wombat-gate lease show    [--kind KIND] [--json]
 - Identity: `claim`, `renew`, `release` require a session name
   (`WOMBAT_SESSION` or `--session`); the `pid…` fallback is refused, because a
   lease must outlive the process that took it.
-- Exit codes (in addition to the existing 0–5): `6` held by another session
-  (stderr names the holder, since, expires); `7` not yours (`renew` / `release`
-  of someone else's lease). `check` exits `0` if free or yours, `6` otherwise.
+- Exit codes (in addition to the existing 0–6): `7` held by another session
+  (stderr names the holder, since, expires); `8` not yours (`renew` / `release`
+  of someone else's lease). `check` exits `0` if free or yours, `7` otherwise.
 - Taking over someone else's lease is `claim --steal`, a human-only escape
   hatch under the same agent check as `--allow-broad` / `--unsafe`.
 - `show` prints one row per live resource: kind, name, holder, mode, since,

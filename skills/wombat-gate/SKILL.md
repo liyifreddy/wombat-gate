@@ -40,11 +40,12 @@ burrow at a time) and commits only the paths you name.
 | Code | Meaning | Do this |
 |---|---|---|
 | 0 | committed; the sha and file list printed are from your commit | carry on |
-| 1 | git error (e.g. a commit hook refused the message) | read the message, fix, retry; your paths' staging was restored — unless stderr says HEAD moved meanwhile, then check `wombat-gate status -- <paths>` first |
+| 1 | git error (e.g. a commit hook refused the message, or HEAD could not be read) | read the message, fix, retry; nothing was committed and the index was left as it was — if stderr says HEAD could not be read or HEAD moved, check `wombat-gate status -- <paths>` first and report a disk problem |
 | 2 | refused (bad path, `.`, glob, a forbidden option) or usage error | name real paths inside the repo; use only allowed commands |
 | 3 | nothing to commit under your paths — or another process's commit already took your changes (the message says which) | check `git log -1 -- <paths>`; do not commit again blindly |
 | 4 | waited too long in the queue (`--timeout`, default 600 s) | run `wombat-gate who`, wait, retry later |
-| 5 | a git process that does not use wombat-gate kept a lock | report it with the message; do not delete the lock |
+| 5 | a git process that does not use wombat-gate kept a lock, or other commits kept landing while we built ours | report it with the message; do not delete the lock |
+| 6 | committed (the sha is printed), but writing the index failed afterwards, so it still has the old entries for your paths | report the disk error; once the disk is fine run the same `wombat-gate commit` again: it repairs the index and exits 3. Never commit the "staged" old versions |
 
 If two agents commit the same path, the first commit takes both agents'
 changes; the second gets exit 3. Keep to your own paths.
