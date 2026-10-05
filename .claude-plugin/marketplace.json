@@ -1,0 +1,12 @@
+{
+  "name": "wombat-gate",
+  "description": "wombat-gate: a git commit queue for many Claude Code sessions sharing one working tree.",
+  "owner": { "name": "liyifreddy" },
+  "plugins": [
+    {
+      "name": "wombat-gate",
+      "source": "./",
+      "description": "Git commit queue + guard hook + skill for concurrent Claude Code sessions in one checkout."
+    }
+  ]
+}
