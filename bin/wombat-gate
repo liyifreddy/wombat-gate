@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 EXIT_OK = 0
 EXIT_GIT_ERROR = 1
@@ -1270,10 +1270,21 @@ def cmd_log(args):
 
 # ---------------------------------------------------------------- cli
 
+# Side view: head and ear on the left, round back, stubby legs, backside plugging the burrow.
+WOMBAT = "\n".join([
+    '   ^  .-"""""""""-.  _____',
+    '  (o)/             \\/#####\\',
+    '  (_     _______    |######|  one bum in the burrow',
+    '    |_|_|       |_|_|######|',
+    '~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~',
+]) + "\n"
+
+
 def main(argv=None):
     # allow_abbrev=False everywhere: otherwise `--allow` / `--uns` would silently mean
     # --allow-broad / --unsafe and slip past hooks that look for the full flag.
-    p = argparse.ArgumentParser(prog="wombat-gate", description=__doc__.split("\n\n")[0], allow_abbrev=False)
+    p = argparse.ArgumentParser(prog="wombat-gate", description=WOMBAT + "\n" + __doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     p.add_argument("--version", action="version", version="wombat-gate " + __version__)
     sub = p.add_subparsers(dest="cmd", required=True)
 

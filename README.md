@@ -1,21 +1,57 @@
-# wombat-gate
+# 🕳️ wombat-gate
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/liyifreddy/wombat-gate/main/docs/img/wombat-gate-banner.jpg" width="100%"
+       alt="wombat-gate banner illustration">
+</p>
 
 **One at a time through the burrow.** A commit queue for many AI agents (or
-humans) sharing one git working tree. ([中文简介](README.zh-CN.md))
+humans) sharing one git working tree. ([中文简介](https://github.com/liyifreddy/wombat-gate/blob/main/README.zh-CN.md))
 
-```
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-       .-'''''''''''''''''-.           ~ the burrow ~
-     .'   .-'''''''''''-.   '.
-    /    /   .-'''''-.   \    \      one wombat bottom, wedged in:
-   |    |   /         \   |    |     a plate of cartilage and bone.
-   |    |  |     *     |  |    |     nobody else gets past.
-   |    |   \  _____  /   |    |
-    \    \  (__)   (__)  /    /  <-  two stubby back legs
-     '.   '-.._______..-'   .'
-       '-._______________.-'
-                              [] [] []  <- wombat poo is cube-shaped
-```
+## 😩 The problem
+
+You run several Claude Code sessions (or any agents) in **one** checkout. Then:
+
+- 🧺 **Commits sweep up other agents' files.** `git add -A`, `git commit -a` or a bare
+  `git commit` takes whatever is staged, including a neighbour's half-finished work. We
+  had two such commits in two days before writing this tool.
+- 🥊 **Agents fight over git.** Every index write takes `.git/index.lock`; the second
+  writer fails with `index.lock: File exists`, retries on its own schedule, and the
+  retries trample each other's index. In our self-test, 8 plain-git writers × 15 commits
+  landed only 1–10 of 120 commits; the rest died on the lock.
+- 🐢 **Every commit scans the whole tree.** `git commit` first refreshes the index: one
+  `lstat()` per tracked file. On a 22k-file repository on a 9p-mounted Windows drive (WSL)
+  that is tens of thousands of 9p requests and 30–70 s per commit; in a burst the queue of
+  agents waited up to 6 minutes. Each 9p request needs a contiguous chunk of kernel
+  memory, so when memory runs low those whole-tree scans are what fail first — and the
+  mount drops for every session (that was the root cause of our drive dropping out).
+- 💣 **Agents reach for whole-tree commands** — `git add -A`, `git stash`,
+  `git reset --hard`, `git checkout -- .` — and throw away or take other sessions' work.
+
+## ✨ What you get
+
+- ✅ **Only your own paths** — `wombat-gate commit -m MSG -- PATH...` commits exactly
+  those paths; what others staged stays staged and out of your commit.
+- ✅ **No more fights over git** — writers wait in line for one local `flock` instead of
+  failing and retrying into each other's index. Self-test: 120 of 120 commits land;
+  median queue wait 0.14 s and lock hold 0.026 s on an idle machine (0.9 s / 0.16 s with
+  ten other agent sessions running).
+- ✅ **No whole-tree scan** — the commit is built in a private copy of the index and only
+  your paths are grafted onto `HEAD`, so git never stats the rest of the tree: on that
+  22k-file 9p repository the lock hold went from 30–70 s to 3.07 s in the first real
+  commit after the switch (one measurement; "a few seconds" in general).
+- ✅ **A guard hook** for Claude Code that blocks whole-tree git commands (staging,
+  committing, stash, reset, checkout, clean, …) — 197 test commands it must block or pass.
+- ✅ **Never deletes git's lock files** — if a git process outside the queue holds one,
+  wombat-gate backs off and retries.
+- ✅ **Honest reports** — the sha and file list come from the commit it actually made,
+  not from `HEAD`.
+- ✅ **A timing log** — one JSON line per operation: queue wait, lock hold, each git step.
+- ✅ **One-step install for Claude Code** — a plugin with the CLI, the guard hook and a
+  skill that teaches the agent the rules. Checked against real `git commit` on every
+  run of the self-test, plus 36 re-introduced past bugs that must each turn a check red.
+
+## 🕳️ How it works
 
 Wombats are lovely, stubborn, and built like a door. When something chases a
 wombat, it dives into its burrow and plugs the entrance with its backside: a
@@ -35,22 +71,19 @@ into `.git`:
                             local disk)
 ```
 
-## Why
+<p align="center">
+  <img src="https://raw.githubusercontent.com/liyifreddy/wombat-gate/main/docs/img/wombat-gate-how-it-works-captioned.jpg" width="100%"
+       alt="Four panels: robots queue at the burrow; one goes in with the wombat; inside it puts its crate on its own shelf; it comes out and the next one goes in">
+</p>
 
-Run a dozen Claude Code sessions (or any agents) against **one** working tree
-and they will all call `git add` / `git commit` / `git status` on their own
-schedule. Git was not built for that:
+1. **Wait in queue** — every agent that wants to write lines up outside the burrow.
+2. **Take the lock (flock, local disk)** — one at a time goes in; the lock is a file under `~/.local/state`, outside the repository, and that directory must be on a local disk (wombat-gate warns when it is not).
+3. **Commit only your own paths** — inside, it puts down only its own crate: the paths it named.
+4. **Release, next in line** — it comes out, the lock is released, and the next agent goes in.
 
-- every index write takes `.git/index.lock`; the second writer fails with
-  `fatal: Unable to create '.../.git/index.lock': File exists.`
-- `git add -A`, `git commit -a` and a bare `git commit` sweep other agents'
-  half-finished work into *your* commit;
-- repo-wide `git status`, repeated by many agents, can saturate a slow or
-  network-backed filesystem (WSL `/mnt/c`-style 9p mounts, SMB, NFS).
+<p align="center"><sub>Illustrations generated with Google Gemini and edited by the author.</sub></p>
 
-In the self-test (8 writers × 15 commits on a local disk), plain git landed
-1–10 of 120 commits across our runs; the other 110–119 failed on `index.lock`.
-With wombat-gate: 120 of 120, median wait in the queue well under 0.1 s.
+## 🧭 Features in detail
 
 | | |
 |---|---|
@@ -64,7 +97,7 @@ With wombat-gate: 120 of 120, median wait in the queue well under 0.1 s.
 
 Single file, Python ≥ 3.8 standard library only, Linux / macOS / WSL.
 
-## Install
+## 📦 Install
 
 ```sh
 git clone https://github.com/liyifreddy/wombat-gate.git
@@ -74,10 +107,10 @@ wombat-gate --version
 
 Or as a Claude Code plugin, which brings the CLI (on the Bash tool's `PATH`),
 the guard hook and a skill that teaches the agent the rules — see
-[Claude Code plugin](#claude-code-plugin). Install the CLI as above too if you
+[Claude Code plugin](#-claude-code-plugin). Install the CLI as above too if you
 want to use it from your own terminal.
 
-## Usage
+## 🛠️ Usage
 
 ```sh
 export WOMBAT_SESSION=agent-7                       # optional: your name in the log / queue
@@ -97,7 +130,7 @@ lock never cleared (or `HEAD` kept moving) · `6` committed, but writing the
 index failed afterwards (a disk error) — run the same command again once the disk
 is fine; it repairs the index and exits 3.
 
-### What exactly happens on `commit`
+### 🔍 What exactly happens on `commit`
 
 Inside the queue, with `GIT_LITERAL_PATHSPECS=1`, wombat-gate makes the commit
 `git add -A -- PATHS && git commit -- PATHS` would make, without looking at the
@@ -152,7 +185,7 @@ different case than on disk in a case-insensitive checkout, and with
 Two agents committing the *same* path: the first takes both agents' changes,
 the second gets exit 3. Give agents disjoint paths.
 
-### Paths
+### 📁 Paths
 
 `commit` and `status` take literal files or directories strictly inside the
 repository. Refused: the repository root (`.`, `./`, its absolute path),
@@ -163,7 +196,7 @@ judged by where the link lives, not where it points. Note: your git hooks inheri
 `GIT_LITERAL_PATHSPECS=1`; a hook that globs (`git diff --cached -- '*.py'`) will
 match nothing during a wombat-gate commit.
 
-### `wombat-gate run`
+### ▶️ `wombat-gate run`
 
 An allow-list: `push`, `fetch`, `tag`, `branch`, `notes`, and read-only `log`,
 `show`, `diff`, `rev-parse`, `ls-files`, `blame`. `push`, `fetch` and the
@@ -179,7 +212,7 @@ any command (it truncates the named file). Everything else — `add`, `commit`,
 `merge`, `pull`, `gc`, … — and global options before the subcommand (`-C`,
 `-c`, `--git-dir`) is refused.
 
-### Escape hatches are for humans
+### 🚪 Escape hatches are for humans
 
 `--allow-broad` (whole-repo paths) and `run --unsafe` (anything outside the
 allow-list) exist for a human cleaning up. They are refused when the process
@@ -190,7 +223,7 @@ shell spelling of the flags (quotes, line continuations, variables), which a
 text-matching hook cannot. Option abbreviations are disabled, so `--allow` is an
 error, not `--allow-broad`.
 
-### Retries
+### 🔁 Retries
 
 Only git's lock-collision message (`Unable to create '….lock': File exists`)
 is retried; git prints it before writing anything, so a retry is safe.
@@ -198,7 +231,7 @@ Disk-full, permission, ref-conflict and remote-rejection errors fail at once.
 If `HEAD` cannot be read (an I/O error on a failing mount), wombat-gate says so
 and exits 1; it does not guess that someone else moved it.
 
-### Configuration
+### ⚙️ Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -217,21 +250,21 @@ and exits 1; it does not guess that someone else moved it.
 The lock is per repository (keyed by the real path of its git common dir), so
 linked worktrees of one repository share one queue.
 
-## Using it with Claude Code
+## 🤖 Using it with Claude Code
 
 1. Install the CLI (above) and put the rules where every session reads them,
    e.g. in `CLAUDE.md`:
 
-   > Commit with `wombat-gate commit -m "..." -- <your paths>`; check with
+   > ✅ Commit with `wombat-gate commit -m "..." -- <your paths>`; check with
    > `wombat-gate status -- <your paths>`; push with `wombat-gate run -- git push`.
-   > Never `git add -A`, `git add .`, `git commit -a`, `git stash`, or a
-   > repo-wide `git status`. Never use the human-only escape hatches.
+   > ⛔ Never `git add -A`, `git add .`, `git commit -a`, `git stash`, or a
+   > repo-wide `git status`. ⛔ Never use the human-only escape hatches.
 
 2. Add a `PreToolUse` hook on the Bash tool as a second layer — either the
    plugin below, or [`hooks/guard.py`](hooks/guard.py) in your own
    `.claude/settings.json`. It splits each command the way a shell would
    (`;`, `&&`, pipes, redirections, `bash -c`, `$(...)`, heredocs) and reads
-   git's real arguments, then blocks:
+   git's real arguments, then ⛔ blocks:
    - whole-tree staging and committing: `git add -A` / `-u` / `.` without your
      own paths, `git commit -a`, `git commit` without paths;
    - throwing work away or moving the tree: `git stash` (except `list` / `show`),
@@ -243,7 +276,7 @@ linked worktrees of one repository share one queue.
    - switching off wombat-gate's agent check: setting `WOMBAT_HUMAN_OVERRIDE`,
      unsetting / un-exporting / overwriting `CLAUDECODE`, `env -i`.
 
-   Path-limited forms (`git add -A -- src/mine`, `git reset -q -- src/x.py`,
+   ✅ Path-limited forms (`git add -A -- src/mine`, `git reset -q -- src/x.py`,
    `git checkout -- src/x.py`) pass. It is a guard rail for cooperating
    agents, not a sandbox: it cannot see inside scripts, git aliases or
    `python -c`, and it does not look at other git commands (`cherry-pick`,
@@ -257,7 +290,7 @@ linked worktrees of one repository share one queue.
 For the bigger picture — naming sessions, task cards, a dispatch board, review
 chains, unattended runs — see the [multi-session playbook](PLAYBOOK.md).
 
-## Claude Code plugin
+## 🧩 Claude Code plugin
 
 This repository is also a Claude Code plugin and a one-plugin marketplace:
 
@@ -298,7 +331,7 @@ Without the plugin, use the hook directly: add to `.claude/settings.json`
 }
 ```
 
-## Limits — read before relying on it
+## ⚠️ Limits — read before relying on it
 
 - **Only wombat-gate users queue.** Plain `git` does not take the lock;
   wombat-gate survives it by retrying, but plain git can still fail against
@@ -335,7 +368,7 @@ Without the plugin, use the hook directly: add to `.claude/settings.json`
   first-come-first-served, but at millisecond hold times nobody starves.
 - Uses `SIGALRM` while waiting; only matters if you import it as a module.
 
-## Self-test
+## ✅ Self-test
 
 ```sh
 python3 selftest_wombat_gate.py                # throw-away repos under $TMPDIR (~1 min)
@@ -363,12 +396,14 @@ bare `git commit` fired from inside a wombat-gate commit must be locked out.
 `SELFTEST_WOMBAT_BIN=/path/to/copy` runs the suite against a modified copy of
 the tool.
 
-## Status
+## 📍 Status
 
-0.6.0 — fast commits (private index + tree graft + compare-and-swap). Next: a
+0.6.1 — illustrated README, a small wombat in `--help`, packaging for `pipx`
+packaging and a PyPI release workflow. 0.6.0 — fast commits (private index + tree graft +
+compare-and-swap). Next: a
 session registry (who holds which machine or directory), sketched in
 [DESIGN.md](DESIGN.md).
 
-## License
+## 📄 License
 
 MIT — see [LICENSE](LICENSE).

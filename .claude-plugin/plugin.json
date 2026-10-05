@@ -1,11 +1,20 @@
 {
   "name": "wombat-gate",
   "displayName": "wombat-gate",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "One at a time through the burrow: a git commit queue for many Claude Code sessions sharing one working tree. Ships the wombat-gate CLI, a guard hook for whole-tree git commands, and a skill with the rules.",
-  "author": { "name": "liyifreddy" },
+  "author": {
+    "name": "liyifreddy"
+  },
   "homepage": "https://github.com/liyifreddy/wombat-gate",
   "repository": "https://github.com/liyifreddy/wombat-gate",
   "license": "MIT",
-  "keywords": ["git", "multi-agent", "concurrency", "lock", "queue", "hooks"]
+  "keywords": [
+    "git",
+    "multi-agent",
+    "concurrency",
+    "lock",
+    "queue",
+    "hooks"
+  ]
 }

@@ -1,0 +1,23 @@
+# Publish to PyPI when a GitHub Release is published (PyPI Trusted Publishing: no API token).
+name: publish
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: uv build
+      - name: Check the version matches the release tag
+        run: |
+          v=$(ls dist/*.tar.gz | sed -E 's/.*-([0-9][^-]*)\.tar\.gz/\1/')
+          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $v"; exit 1; }
+      - uses: pypa/gh-action-pypi-publish@release/v1
