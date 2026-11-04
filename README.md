@@ -58,7 +58,10 @@ Put a few Claude Code sessions (or any agents) in one checkout and this happens 
 - ✅ **No whole-tree scan.** Only your paths are touched. That 22k-file repo went from
   30–70 s to 3 s on its first real commit.
 - ✅ **A guard hook** that stops whole-tree git commands in Claude Code (tested on 197 commands).
-- ✅ **Hands off git's lock files.** If another git process holds one, it waits and retries.
+- ✅ **Hands off other people's locks.** If another git process holds one, it waits and retries.
+- ✅ **Cleans up after itself.** If a wombat-gate gets killed while holding `index.lock`, the next
+  commit spots its own leftover and removes it. Anyone else's lock is only reported:
+  `wombat-gate doctor` says how old it is, who has it open, and what to do.
 - ✅ **A timing log**: queue wait, lock hold and every git step, one JSON line per commit.
 - ✅ **One-line install** as a Claude Code plugin, with the hook and a skill that teaches
   the agent the rules.
@@ -110,7 +113,8 @@ wombat-gate commit -n -m "..." -- src/parser   # dry run
 wombat-gate status -- src/parser               # status of your paths only
 wombat-gate run -- git push                    # push, fetch, tag, log, ... (an allow-list)
 wombat-gate who                                # who is in the burrow
-wombat-gate log -n 50                          # recent timings
+wombat-gate log -n 50                          # recent timings (--stats: p50 / p95)
+wombat-gate doctor                             # git lock files: in use, stale, or ours
 ```
 
 Set `WOMBAT_SESSION=agent-7` (or `--session`) so `who` can tell you who is in there.
@@ -146,8 +150,8 @@ The full list is in the [reference](REFERENCE.md#limits-in-full).
 ## ✅ Self-test
 
 ```sh
-python3 selftest_wombat_gate.py               # ~1 min, throw-away repos on a local disk
-python3 selftest_wombat_gate.py --mutants     # 36 past bugs put back; each must turn a check red
+python3 selftest_wombat_gate.py               # 1–7 min depending on load, throw-away repos on a local disk
+python3 selftest_wombat_gate.py --mutants     # 44 past bugs put back; each must turn a check red
 bash hooks/selftest_guard.sh                  # 197 commands the guard must block or let through
 ```
 
@@ -155,6 +159,9 @@ Every fast commit is compared with what plain `git commit` does on a copy of the
 
 ## 📍 Status
 
+- 0.8.0 candidate — staged deletion/rename support, reviewed file counts, checked worktree integration and release checks. See [CHANGELOG](CHANGELOG.md).
+
+- 0.7.0 — cleans up its own stale `index.lock`; `doctor`; timing p50 / p95.
 - 0.6.2 — before / after picture, language switch.
 - 0.6.1 — illustrated README, a tiny wombat in `--help`, pipx packaging, PyPI workflow.
 - 0.6.0 — fast commits (private index + tree graft + compare-and-swap).
@@ -164,3 +171,72 @@ How it's built and why: [DESIGN.md](DESIGN.md).
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).
+
+## Staged deletions, renames and reviewed counts (0.8)
+
+Name both old and new paths for a rename, including when `git mv` or `git rm` has already staged the change. HEAD entries missing from the index are handled as deletions when the path is also absent on disk. A path still present on disk is staged from disk, as before.
+
+```sh
+wombat-gate commit -n --expect-files 2 -m 'rename notes' -- '旧目录/笔记.md' 'notes.md'
+wombat-gate commit    --expect-files 2 -m 'rename notes' -- '旧目录/笔记.md' 'notes.md'
+```
+
+The preview shows one row per changed **path**, with both ends of a rename on separate rows. Filenames are JSON-quoted UTF-8, so embedded newlines cannot create extra rows. The summary `删 N / 改名 N / 改 N` means deleted paths excluding rename sources / rename pairs / other changed paths (including additions). A rename is two rows but one pair. `--expect-files N` checks the count again under the queue lock and refuses mismatches (exit 2); use the number of explicitly named changed files for a move. Directories expand recursively, so use the expanded file count rather than the number of directory arguments. Without the flag, the original recursive commit API remains available. Other agents' staging stays outside the selected paths.
+
+## Integrate a worktree branch (0.8)
+
+From the **target** worktree, rebase the committed source branch onto the current target HEAD, run the named checks in the source worktree, then fast-forward:
+
+```sh
+wombat-gate integrate -n --rebase topic --check 'python3 tests/run_all.py'
+wombat-gate integrate    --rebase topic --check 'python3 tests/run_all.py' --check 'python3 tests/regression.py'
+```
+
+The source must already be checked out in a separate worktree and have no tracked changes or nonignored untracked files. At least one `--check` is required. Commands are split into argv without a shell: no pipes, redirection or shell expansion; `--check-timeout` defaults to 600 seconds per command. The repository's common queue covers rebase, checks and fast-forward. The target may have unrelated staged/unstaged work; overlapping tracked, untracked or ignored paths are refused. Ignored source files that target changes would overwrite are also refused. Checks must leave source HEAD and tracked/nonignored files unchanged.
+
+Conflicts stop in the source worktree with the rebase state preserved; inspect it there and explicitly continue or abort before retrying. Failed checks leave the rebased source branch available and do not advance the target. Source branches containing merge commits require manual review. A changed target HEAD, an in-progress operation or unsafe overlap stops integration. There is no automatic stash, force update, conflict resolution, branch deletion or worktree deletion. Only cooperating processes share the queue; ordinary Git processes still need coordination.
+
+## Platform status
+
+| Platform | CLI support | This candidate's evidence |
+|---|---|---|
+| Linux | Supported (Python ≥3.8, Git, POSIX flock/signals) | Full suite runs on WSL's Linux kernel/ext4; separate native Linux host **not tested**. Linux CI configured, not yet run remotely. |
+| WSL | Supported with Linux Git/Python; queue state on Linux local disk | Locally tested on WSL2. Stress fixtures on ext4; source on a Windows mount. Do not mix Windows Git writers with the WSL queue. |
+| macOS | POSIX CLI supported; `/proc`-based lock opener diagnostics are limited | **Not tested locally**. Portable regression/guard/packaging CI configured. |
+| Native Windows | Unsupported: fcntl/flock and POSIX signal timers required | **Not tested**; use WSL. A Windows Git process does not join the WSL lock. |
+
+All platforms require Git with worktree and `merge/rebase --no-autostash` support for `integrate` (local validation: Git 2.43.0). No claim of independent testing on every platform is implied.
+
+## Claude Code, Codex and OpenCode Go
+
+The CLI works independently of a model/provider. These examples provide instructions plus explicit agent markers. Only the existing Claude Code plugin installs its guard hook; the Codex/OpenCode instructions are not a shell-enforcement hook.
+
+**Claude Code:** install the plugin described above; add this project `.claude/settings.json` setting (merge it with existing settings), and put the commit rule in `CLAUDE.md`:
+
+```json
+{"env": {"WOMBAT_NO_ESCAPES": "1", "WOMBAT_SESSION": "claude-task"}}
+```
+
+```text
+Commit only assigned files through wombat-gate. Preview a move with --expect-files N, name both old and new paths, and use the same count for the real commit. Stop if the file list differs. Integrate only a reviewed branch with the task's required --check commands. Ask before pushing or publishing when the task requires approval.
+```
+
+**Codex:** put that same rule in the repository's `AGENTS.md` ([official instructions guide](https://learn.chatgpt.com/docs/agent-configuration/agents-md)). Start it with:
+
+```sh
+WOMBAT_NO_ESCAPES=1 WOMBAT_SESSION=codex-task codex
+# Example command for the agent:
+WOMBAT_NO_ESCAPES=1 wombat-gate commit -n --expect-files 1 -m 'fix parser' -- src/parser.py
+```
+
+**OpenCode Go:** Go is a provider plan; the local OpenCode CLI uses the same project `AGENTS.md` rule ([official rules guide](https://opencode.ai/docs/rules/)). Start your configured OpenCode client with:
+
+```sh
+WOMBAT_NO_ESCAPES=1 WOMBAT_SESSION=opencode-task opencode
+# Example command for the agent:
+WOMBAT_NO_ESCAPES=1 wombat-gate commit --expect-files 1 -m 'fix parser' -- src/parser.py
+```
+
+The shared [skill](skills/wombat-gate/SKILL.md) also describes the workflow. Agent instruction/configuration examples were checked against documentation; all three full interactive clients were **not** launched in this validation. CLI marker and path protections are exercised in self-tests.
+
+Release setup and the diagnosed PyPI `invalid-publisher` failure: [publishing guide](docs/PUBLISHING.md). A maintainer must configure the matching Trusted Publisher; changing YAML alone cannot create it.

@@ -130,7 +130,7 @@ mount and we only need the file list.) Each step's wall time is logged
   `update-index --index-info` (0.2 used `reset -- P`, which also dropped other
   people's partial stagings under P). If `HEAD` moved in between, it does not
   restore: old entries on a new `HEAD` would stage a revert of the foreign
-  commit. A dry run uses `git status` and never stages.
+  commit. A dry run stages in a private index copy; the shared index is untouched, although Git may write content objects.
 - The message is read once and fed on stdin, so `-F -` survives a retry.
 - Lock collisions make git fail before it writes anything, so a commit is
   simply retried. 0.2 instead treated "HEAD moved after a lock error" as "our
@@ -283,3 +283,13 @@ wombat-gate lease show    [--kind KIND] [--json]
 4. Reconciliation with reality: a lease says "agent-7 owns gpu-box-2", not
    that agent-7's job is still running there. A `probe` hook per kind (e.g.
    `ssh host pgrep ...`) could mark leases as *stale*.
+
+## 0.8 commit and integration details
+
+`stage_named` checks selected paths against HEAD and the chosen index. A path absent from disk and index but known to HEAD is already a staged deletion, so it is omitted from `git add` and remains absent in the index. Unknown paths still fail. In classic mode, deleted HEAD entries are seeded into the shared index immediately before `git commit --only`, so Git can match those path arguments and stage their disk deletion into its own commit index; the original selected-path snapshot is restored on failure. The fast path keeps using its private index and grafts the absent entries as deletions. All tree lookup paths are normalized against the repository root, including calls from a subdirectory.
+
+Preview stages in an index copy, reads NUL-separated diff records, identifies rename pairs with Git's rename detection and prints one JSON-quoted row per path. `--expect-files` verifies the reviewed count inside the queue and again at the final selected diff; it does not turn a directory argument into a single file. Unrelated staged entries are neither displayed nor committed. Counts are not a content-approval signature: review changes immediately before committing and coordinate other processes touching the same paths.
+
+`integrate` deliberately requires two existing worktrees rather than checking out a branch in the target's shared working tree. It verifies source cleanliness, operation state, branch identity, dirty target overlap (including ignored files) and a common merge base. Linear rebase runs in the source with auto-stash, auto-squash and updateRefs disabled. Required argv-based checks run there under the queue with individual timeouts; checks must leave the source clean. The target is checked again, then Git performs an unforced fast-forward. Conflicts remain in the source for review; failed checks keep the rebased branch without advancing the target. There is no rollback that could overwrite somebody else's work, and no worktree/branch cleanup. Foreign writers remain outside the cooperative queue.
+
+Lock interval validation uses monotonic acquisition/release timestamps in addition to wall-clock log fields. WSL wall time was observed stepping backwards between sequential commits by the same writer; it cannot prove queue overlap.

@@ -17,7 +17,7 @@ burrow at a time) and commits only the paths you name.
   - name only your own paths; a directory covers everything under it;
   - long message: write it to a file and use `wombat-gate commit -F <file> -- <paths>`;
   - add `--session <your name>` so others can see who is in the queue.
-- Look before you commit: `wombat-gate commit -n -m x -- <paths>` (dry run, touches nothing).
+- Look before you commit: `wombat-gate commit -n -m x -- <paths>` (dry run; leaves the shared index and HEAD untouched).
 - Status: `wombat-gate status -- <your paths>` (add `-uno` to skip untracked files).
 - Push: `wombat-gate run -- git push`.
 - Who is committing right now: `wombat-gate who`.
@@ -28,7 +28,9 @@ burrow at a time) and commits only the paths you name.
   `git stash`, `git reset --hard`, `git clean -f`, `git checkout -- .`,
   `git restore .` — each one takes or throws away other agents' work.
 - Repo-wide `git status` / `git diff` on a big tree — use your paths.
-- Never delete `.git/index.lock` by hand. If wombat-gate exits 5, report it.
+- Never delete `.git/index.lock` (or any `*.lock` in `.git`) by hand. If wombat-gate exits 5,
+  run `wombat-gate doctor` and report what it says; a stale lock is for a human to remove.
+  (wombat-gate removes its own leftover lock by itself.)
 - Never use the human-only escape hatches (`--allow-broad`, `--unsafe`) and never
   try to switch off wombat-gate's agent check (do not touch `CLAUDECODE`, do not
   run commands under `env -i`). If you think you need one, stop and ask.
@@ -49,3 +51,11 @@ burrow at a time) and commits only the paths you name.
 
 If two agents commit the same path, the first commit takes both agents'
 changes; the second gets exit 3. Keep to your own paths.
+
+## Reviewed moves and worktree integration (0.8)
+
+For a move, name the old and new paths even if Git already staged the rename/deletion. Run `wombat-gate commit -n --expect-files N -m MESSAGE -- PATH...`, review the one-row-per-path output, then use the same N and path list for the real commit. A rename contributes two paths but one rename pair. Directory parameters expand, so use the expanded file count. Stop on count mismatch. No reset of staged deletions is needed.
+
+From the target worktree, integrate a reviewed committed branch with `wombat-gate integrate --rebase BRANCH --check 'python3 tests/run_all.py'`. Repeat `--check` for every task-required check. The clean source must already have its own worktree. On conflict stop and report the source path; the rebase remains there. On failed checks the rebased source is retained and the target is not advanced. Never remove branches/worktrees as cleanup. Use the project's permission rules before integration, pushing or publishing.
+
+For Codex and OpenCode, put these rules in project AGENTS.md and start the CLI with `WOMBAT_NO_ESCAPES=1 WOMBAT_SESSION=<task>`. This installs instructions, not a shell guard. The Claude Code plugin supplies its own Bash guard hook. See the README for configuration examples and platform limits.

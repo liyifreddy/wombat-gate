@@ -136,7 +136,30 @@ and exits 1; it does not guess that someone else moved it.
 The lock is per repository (keyed by the real path of its git common dir), so
 linked worktrees of one repository share one queue.
 
-## Exit codes
+## Stale locks (0.7)
+
+Right after creating `.git/index.lock`, wombat-gate writes a ticket next to its queue
+lock (local disk): its pid and start time, and the lock file's inode and mtime. The
+ticket is removed when the commit ends, also on SIGTERM / SIGHUP / SIGINT.
+
+If wombat-gate is killed with SIGKILL while holding the lock, the lock stays behind. The
+next wombat-gate that finds `index.lock` removes it only if **all** of these hold:
+
+1. the ticket names this exact lock path;
+2. the ticket's process is dead (pid and start time checked);
+3. the lock file's inode and mtime match the ticket (it is that very file);
+4. the caller holds the queue lock (no other wombat-gate is inside).
+
+This is the only lock file wombat-gate ever deletes. It logs a `stale_lock_removed` line.
+
+Any other lock is only diagnosed by `wombat-gate doctor [--json]`: for `index.lock`,
+`HEAD.lock`, `packed-refs.lock`, `config.lock` and `refs/**/*.lock` it reports the age,
+which processes have it open, and whether git is running in this repository. A lock
+older than 10 minutes (`WOMBAT_STALE_AFTER`) that nobody has open, with no git running,
+is reported as stale with a one-line `rm` for a human. Agents must not delete it.
+`doctor` exits 1 when something needs attention. It also shows who holds the queue and
+the queue wait / lock hold p50 and p95 of the last 200 commits (also `log --stats`).
+
 
 Exit codes: `0` ok · `1` git error · `2` usage / refused · `3` nothing to commit
 under the given paths · `4` timed out waiting in the queue · `5` a foreign git
@@ -252,7 +275,7 @@ Without the plugin, use the hook directly: add to `.claude/settings.json`
 
 ```sh
 python3 selftest_wombat_gate.py                # throw-away repos under $TMPDIR (~1 min)
-python3 selftest_wombat_gate.py --mutants      # re-introduce 36 past bugs; each must turn its check red
+python3 selftest_wombat_gate.py --mutants      # re-introduce 44 past bugs; each must turn its check red
 bash hooks/selftest_guard.sh                   # 197 commands the guard must block or let through
 ```
 
@@ -276,3 +299,11 @@ bare `git commit` fired from inside a wombat-gate commit must be locked out.
 `SELFTEST_WOMBAT_BIN=/path/to/copy` runs the suite against a modified copy of
 the tool.
 
+
+## 0.8 additions
+
+`commit [-n] --expect-files N -m MESSAGE -- PATH...` verifies N changed paths, including two paths for each rename. The preview prints one row per path and the deletion / rename-pair / other-change counts. A mismatch exits 2. Directory arguments expand recursively; N is the expanded path count. Already-staged deletions need no manual reset; name both ends of a rename. The original commit API without `--expect-files` retains its recursive behavior. The dry run stages only an index copy and leaves the shared index untouched.
+
+`integrate [-n] --rebase BRANCH --check 'COMMAND ARG...' [--check ...] [--check-timeout SECONDS] [--timeout SECONDS] [--session NAME]` runs from the target worktree. BRANCH must be a local branch checked out cleanly in another existing worktree. Checks are required, argv-based (no shell), executed in that source worktree, and individually limited to 600 seconds by default. The common queue covers the whole operation. Target dirty overlap (including ignored files), source merge commits, operation state, conflict, failed checks or changed HEAD stop integration. On conflict the rebase state remains in the source; on check failure the rebased source remains and target is not advanced. No worktree or branch is removed. Exit 0 means integrated (or dry-run), 1 means stopped/error, 2 means invalid usage, 4 means queue timeout. A nonzero result does not imply that the source rebase was undone.
+
+Platform and agent setup: [English README](README.md#platform-status). Release account setup: [publishing](docs/PUBLISHING.md). The original Linux-specific diagnostic suite is not the macOS portable regression suite.

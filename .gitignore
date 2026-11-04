@@ -1,2 +1,4 @@
+.validation/
+selftest-*.log
 __pycache__/
 *.pyc

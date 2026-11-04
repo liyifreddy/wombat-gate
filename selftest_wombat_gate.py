@@ -20,6 +20,7 @@ Usage: python3 selftest_wombat_gate.py [--base DIR] [--writers 8] [--commits 15]
 Refuses to run when --base is on a network / 9p / drvfs mount.
 """
 import argparse
+import glob
 import json
 import os
 import shlex
@@ -47,7 +48,8 @@ def check(name, ok, detail=""):
 def base_env(state):
     env = dict(os.environ)
     for k in list(env):
-        if k.startswith("WOMBAT_") or k.startswith("GIT_") or k == "CLAUDECODE":
+        if k.startswith("WOMBAT_") or k.startswith("GIT_") or k in (
+                "CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "DINGO_NO_ESCAPES"):
             del env[k]
     env.update({
         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -173,7 +175,9 @@ def scen_negctl(tmp, env, w, k, n_files):
 
 
 def overlaps_of(recs):
-    iv = sorted((r["t_acq"], r["t_rel"]) for r in recs if "t_acq" in r and "t_rel" in r)
+    # WSL wall time may step backwards; lock intervals use a process-shared monotonic clock.
+    iv = sorted((r.get("mono_acq", r["t_acq"]), r.get("mono_rel", r["t_rel"]))
+                for r in recs if "t_acq" in r and "t_rel" in r)
     return len(iv), sum(1 for a, b in zip(iv, iv[1:]) if b[0] < a[1])
 
 
@@ -1096,7 +1100,9 @@ def scen_fast_messages(tmp, env):
             if argv[0] == "cleanup=strip":
                 sh(["git", "config", "commit.cleanup", "strip"], repo, env)
                 argv = argv[1:]
-            write(repo, "m/n.txt", "%d\n" % i)
+            # Vary size: this checks messages, not sub-second filesystem timestamps.
+            # Racy-index semantics have their own controlled test below.
+            write(repo, "m/n.txt", "x" * (i + 1) + "\n")
             r = gq(repo, dict(env, WOMBAT_COMMIT_MODE=m), "commit", *argv, "--", "m")
             out[m] = (r.returncode, sh(["git", "log", "-1", "--format=%B|%T|%an|%ae|%cn|%ce"], repo, env).stdout)
         if out["classic"][0] != 0 or out["classic"] != out["fast"]:
@@ -1210,6 +1216,122 @@ def scen_head_unreadable(tmp, env):
           and n_commits(repo, env) == 1, repr((r.returncode, last.get("result"), r.stderr[-150:])))
 
 
+def scen_stale_locks(tmp, env):
+    """0.7: an index.lock left by a wombat-gate that was killed holding it is removed by the
+    next commit (and only that one); foreign or live locks are only diagnosed."""
+    env = dict(env, WOMBAT_GIT_RETRIES="1", WOMBAT_GIT_BACKOFF="0.05")
+    repo = make_repo(os.path.join(tmp, "stale"), env, 5)
+    lock = os.path.join(repo, ".git", "index.lock")
+    state = env["WOMBAT_STATE_DIR"]
+    write(repo, "mine/a.txt", "a\n")
+    r = gq(repo, dict(env, WOMBAT_TEST_DIE_HOLDING_LOCK="1"), "commit", "-m", "dies", "--", "mine")
+    tickets = glob.glob(os.path.join(state, "locks", "*.gitlock"))
+    check("0.7: killed while holding index.lock -> lock and ticket left behind",
+          r.returncode == -9 and os.path.exists(lock) and len(tickets) == 1, repr((r.returncode, tickets)))
+    ticket = tickets[0] if tickets else os.path.join(state, "locks", "x.gitlock")
+    d = gq(repo, env, "doctor", "--json")
+    try:
+        items = json.loads(d.stdout)["checks"]
+    except ValueError:
+        items = []
+    check("0.7: doctor names it as left by a dead wombat-gate",
+          any(i["level"] == "warn" and "left by wombat-gate" in i["message"] for i in items), d.stdout[-300:])
+    r = gq(repo, env, "commit", "-m", "after", "--", "mine")
+    last = [x for x in read_log(state) if x.get("op") == "stale_lock_removed"]
+    check("0.7: next commit removes our own stale lock, logs it, and commits",
+          r.returncode == 0 and len(last) == 1 and subj(repo, env) == "after" and not os.path.exists(lock),
+          repr((r.returncode, r.stderr[-200:], len(last))))
+    check("0.7: ticket removed after a normal commit", not os.path.exists(ticket), ticket)
+
+    # a foreign lock (no ticket): never deleted
+    with open(lock, "w"):
+        pass
+    write(repo, "mine/b.txt", "b\n")
+    r = gq(repo, env, "commit", "-m", "foreign", "--", "mine")
+    check("0.7: a foreign index.lock is never removed", r.returncode == 5 and os.path.exists(lock),
+          repr((r.returncode, r.stderr[-150:])))
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    d = gq(repo, env, "doctor", "--json")
+    try:
+        items = json.loads(d.stdout)["checks"]
+    except ValueError:
+        items = []
+    st = [i for i in items if "looks stale" in i["message"]]
+    check("0.7: doctor calls an old unopened foreign lock stale and leaves removal to a human",
+          len(st) == 1 and st[0]["level"] == "warn" and "rm '" in st[0]["hint"] and "agents" in st[0]["hint"]
+          and os.path.exists(lock) and d.returncode == 1, d.stdout[-300:])
+    holder = subprocess.Popen([sys.executable, "-c", "import sys,time; f=open(sys.argv[1]); time.sleep(30)", lock])
+    try:
+        time.sleep(0.5)
+        d = gq(repo, env, "doctor", "--json")
+        check("0.7: doctor sees who has a lock file open",
+              ("in use by pid %d" % holder.pid) in d.stdout, d.stdout[-300:])
+    finally:
+        holder.kill()
+        holder.wait()
+
+    # ticket says ours, but the owner is alive -> keep
+    st0 = os.stat(lock)
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        with open("/proc/%d/stat" % live.pid) as f:
+            s = f.read()
+        start = int(s[s.rindex(")") + 2:].split()[19])
+        with open(ticket, "w") as f:
+            json.dump({"pid": live.pid, "start": start, "lock": lock, "ino": st0.st_ino,
+                       "mtime_ns": st0.st_mtime_ns, "t": time.time()}, f)
+        r = gq(repo, env, "commit", "-m", "liveowner", "--", "mine")
+        check("0.7: ticket owner still alive -> lock kept", r.returncode == 5 and os.path.exists(lock),
+              repr((r.returncode, r.stderr[-150:])))
+    finally:
+        live.kill()
+        live.wait()
+    # a ticket without a pid is not trusted
+    with open(ticket, "w") as f:
+        json.dump({"lock": lock, "ino": st0.st_ino, "mtime_ns": st0.st_mtime_ns, "t": time.time()}, f)
+    r = gq(repo, env, "commit", "-m", "nopid", "--", "mine")
+    check("0.7: ticket without a pid -> lock kept", r.returncode == 5 and os.path.exists(lock),
+          repr((r.returncode, r.stderr[-150:])))
+    # ticket owner dead, but the lock file is a different file now -> keep
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    with open(ticket, "w") as f:
+        json.dump({"pid": dead.pid, "start": 1, "lock": lock, "ino": st0.st_ino + 12345,
+                   "mtime_ns": st0.st_mtime_ns, "t": time.time()}, f)
+    r = gq(repo, env, "commit", "-m", "otherfile", "--", "mine")
+    check("0.7: ticket owner dead but the lock is another file -> kept", r.returncode == 5 and os.path.exists(lock),
+          repr((r.returncode, r.stderr[-150:])))
+    check("0.7: giving up on a foreign lock points to `wombat-gate doctor`", "wombat-gate doctor" in r.stderr,
+          r.stderr[-200:])
+    os.remove(lock)
+    os.remove(ticket)
+    # killed after writing the new index into the lock (mtime changed) -> still recognised
+    write(repo, "mine/c.txt", "c\n")
+    r = gq(repo, dict(env, WOMBAT_TEST_DIE_WRITING_INDEX="1"), "commit", "-m", "dies2", "--", "mine")
+    r2 = gq(repo, env, "commit", "-m", "after2", "--", "mine")
+    # the killed run had already moved HEAD (fast path: ref first, index last), so the next
+    # run reclaims the lock, repairs the index and finds nothing left to commit (exit 3)
+    clean = sh(["git", "status", "--porcelain", "--", "mine"], repo, env).stdout.strip() == ""
+    check("0.7: killed while writing the index into the lock -> next commit still reclaims it",
+          r.returncode == -9 and r2.returncode == 3 and subj(repo, env) == "dies2" and not os.path.exists(lock)
+          and clean and "removed" in r2.stderr, repr((r.returncode, r2.returncode, r2.stderr[-200:])))
+    # the classic path reclaims too
+    write(repo, "mine/d.txt", "d\n")
+    r = gq(repo, dict(env, WOMBAT_TEST_DIE_HOLDING_LOCK="1"), "commit", "-m", "dies3", "--", "mine")
+    r2 = gq(repo, dict(env, WOMBAT_COMMIT_MODE="classic"), "commit", "-m", "after3", "--", "mine")
+    check("0.7: the classic path also reclaims our own stale lock",
+          r.returncode == -9 and r2.returncode == 0 and subj(repo, env) == "after3", repr((r.returncode, r2.returncode, r2.stderr[-200:])))
+    # doctor on a repository that does not answer: returns in time
+    es, _ = shim_git(tmp, env, "slowrp", '*" rev-parse "*', "sleep 30")
+    t0 = time.time()
+    d = gq(repo, dict(es, WOMBAT_DOCTOR_TIMEOUT="2"), "doctor", "--json")
+    check("0.7: doctor returns in time when the repository hangs", time.time() - t0 < 10 and d.returncode == 1
+          and "did not answer" in d.stdout, repr((round(time.time() - t0, 1), d.returncode, d.stdout[-200:])))
+    s = gq(repo, env, "log", "--stats")
+    check("0.7: log --stats prints p50 / p95", "p50" in s.stdout and "p95" in s.stdout, s.stdout)
+
+
 # Mutation check (--mutants): re-introduce a past bug into a copy of the tool or
 # of the guard hook and confirm that the check written for it goes red, while the
 # unmodified originals pass. Entries:
@@ -1250,7 +1372,8 @@ MUTANTS = [
      "        if dt.returncode == 0:", "        if False:",
      "reported file list = files in our commit"),
     ("tool", "add step not timed",
-     'env_extra=lit, step="add")', "env_extra=lit)",
+     'return git_retry(command, stats, env_extra=env, step="add")',
+     'return git_retry(command, stats, env_extra=env)',
      "log: per-step timings"),
     ("tool", "fast: update-ref without the old value (no compare-and-swap)",
      '"HEAD", new, head or ""]', '"HEAD", new]',
@@ -1310,6 +1433,26 @@ MUTANTS = [
     ("tool", "HEAD that reads as missing taken for 'HEAD moved'",
      "    if h is None and head0 is not None:", "    if False:",
      "classic: HEAD unreadable after a failed commit"),
+    ("tool", "0.7: stale lock removed without the inode check",
+     "        if st.st_ino != t.get(\"ino\") or st.st_mtime_ns != t.get(\"mtime_ns\"):\n            return False",
+     "        if False:\n            return False", "lock is another file"),
+    ("tool", "0.7: stale lock removed while its owner lives",
+     "        if pid_alive(t.get(\"pid\"), t.get(\"start\")):\n            return False",
+     "        if False:\n            return False", "owner still alive"),
+    ("tool", "0.7: own stale lock never reclaimed",
+     "                    if not reclaimed and self.reclaim(rec):", "                    if False:", "removes our own stale lock"),
+    ("tool", "0.7: ticket not refreshed while writing the index",
+     "        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))\n        self._refresh_ticket()",
+     "        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))", "killed while writing the index"),
+    ("tool", "0.7: classic path does not reclaim",
+     "                    IndexLock(gpr[\"index\"], ticket=lk.path + \".gitlock\", session=lk.session).reclaim(rec)",
+     "                    pass", "classic path also reclaims"),
+    ("tool", "0.7: doctor without a time limit",
+     "    th.join(env_float(\"WOMBAT_DOCTOR_TIMEOUT\", 20))", "    th.join()", "doctor returns in time"),
+    ("tool", "0.7: ticket without a pid trusted",
+     "not isinstance(t.get(\"pid\"), int) or ", "", "ticket without a pid"),
+    ("tool", "0.7: ticket left behind after a normal commit",
+     "            if t and t.get(\"pid\") == os.getpid():", "            if False:", "ticket removed after"),
     ("guard", "guard: env -i not recognised",
      '                if ch == "i":', '                if False:',
      "env -i PATH=/usr/bin"),
@@ -1434,6 +1577,7 @@ def main():
         scen_fast(tmp, env)
         scen_fast_review2(tmp, env)
         scen_head_unreadable(tmp, env)
+        scen_stale_locks(tmp, env)
     finally:
         if not a.keep:
             shutil.rmtree(tmp, ignore_errors=True)

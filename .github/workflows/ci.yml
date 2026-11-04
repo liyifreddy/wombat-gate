@@ -1,0 +1,31 @@
+name: test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: '3.8'}
+          - {os: ubuntu-latest, python: '3.13'}
+          - {os: macos-latest, python: '3.13'}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - if: runner.os == 'Linux'
+        run: python selftest_wombat_gate.py
+      - run: python selftest_release.py
+      - run: bash hooks/selftest_guard.sh
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - name: Install wheel and check CLI
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          wombat-gate --version

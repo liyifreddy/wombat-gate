@@ -14,14 +14,19 @@ Subcommands:
   wombat-gate status [-uno|-unormal|-uall] -- PATH...            status of PATH... (no index lock)
   wombat-gate run -- GIT_ARGS...                                 an allow-listed git command
   wombat-gate who                                                who holds / last held the lock
-  wombat-gate log [-n N]                                         recent timing lines
+  wombat-gate log [-n N] [--stats]                               recent timing lines / p50 and p95
+  wombat-gate doctor [--json]                                    git lock files: who holds them, are they stale
+  wombat-gate integrate --rebase BRANCH --check COMMAND           rebase, validate, fast-forward worktrees
 
 Standard library only. Python >= 3.8, Linux/macOS/WSL (needs fcntl).
 """
 from __future__ import annotations
 
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    raise SystemExit("wombat-gate: native Windows is unsupported (POSIX flock/signals required); use WSL with Linux Git and Python")
 import hashlib
 import json
 import math
@@ -34,9 +39,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
-__version__ = "0.6.2"
+__version__ = "0.8.0"
 
 EXIT_OK = 0
 EXIT_GIT_ERROR = 1
@@ -159,6 +165,42 @@ def lock_path_for(common_dir):
     return os.path.join(lock_dir(), "%s-%s.lock" % (name, key))
 
 
+def proc_start(pid):
+    """Start time of a process in clock ticks since boot (Linux), or None."""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            st = f.read()
+        return int(st[st.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def pid_alive(pid, start=None):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except (OSError, ValueError):
+        return False
+    if start is not None:
+        cur = proc_start(pid)
+        if cur is not None and cur != start:
+            return False                        # the pid now belongs to another process
+    return True
+
+
+def read_ticket(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def log_path():
     return os.environ.get("WOMBAT_LOG") or os.path.join(state_dir(), "wombat-gate.log")
 
@@ -178,7 +220,8 @@ def write_log(rec):
 # --unsafe) are refused unless a human sets WOMBAT_HUMAN_OVERRIDE=1. Enforcing this
 # here covers every shell spelling of the flags (quotes, line continuations,
 # variables), which a text-matching hook cannot.
-AGENT_MARKERS = ("CLAUDECODE", "WOMBAT_NO_ESCAPES")
+AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+                 "WOMBAT_NO_ESCAPES", "DINGO_NO_ESCAPES")
 
 
 def escape_refused(flag):
@@ -274,8 +317,9 @@ class QueueLock:
 
     def _note(self, waited):
         h = self.holder() or {}
-        eprint("wombat-gate: waiting %.0fs for queue (held by %s: %s, pid %s)"
-               % (waited, h.get("session", "?"), h.get("op", "?"), h.get("pid", "?")))
+        held = (" for %.0fs" % (time.time() - h["t"])) if isinstance(h.get("t"), (int, float)) else ""
+        eprint("wombat-gate: waiting %.0fs for queue (held by %s: %s, pid %s%s)"
+               % (waited, h.get("session", "?"), h.get("op", "?"), h.get("pid", "?"), held))
 
     def __enter__(self):
         t = fs_type(os.path.dirname(self.path))
@@ -294,7 +338,7 @@ class QueueLock:
             tmp = self.path + ".holder.%d" % os.getpid()
             with open(tmp, "w") as f:
                 json.dump({"session": self.session, "op": self.op, "pid": os.getpid(),
-                           "host": socket.gethostname(),
+                           "host": socket.gethostname(), "t": time.time(),
                            "since": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f, ensure_ascii=False)
             os.replace(tmp, self.path + ".holder")
         except OSError:
@@ -433,6 +477,7 @@ def finish(rec, rc):
 def finish_locked(rec, lk, t0, rc):
     rec["hold_s"] = lk.hold_s
     rec["t_rel"] = time.time()
+    rec["mono_acq"], rec["mono_rel"] = lk.t_acquired, time.monotonic()
     rec["total_s"] = time.monotonic() - t0
     return finish(rec, rc)
 
@@ -442,6 +487,89 @@ def fail_rc(r):
 
 
 # ---------------------------------------------------------------- subcommands
+
+def stage_named(paths, env, cwd=None, stats=None, argv=None):
+    """Skip only deletions already absent from disk and index but known to HEAD."""
+    top, _ = repo_info(cwd)
+    rels = [os.path.relpath(os.path.abspath(os.path.join(cwd or os.getcwd(), p)), top).replace(os.sep, "/") for p in paths]
+    indexed = check_step(git(["ls-files", "-z", "--"] + rels, cwd=top, env_extra=env), "ls-files").stdout
+    head = head_sha(cwd)
+    known = (check_step(git(["ls-tree", "-z", "--name-only", head, "--"] + rels,
+                           cwd=top, env_extra=env), "ls-tree").stdout if head else "")
+    ix, hs = set(indexed.split("\0")), set(known.split("\0"))
+    selected = []
+    for p, rel in zip(paths, rels):
+        tracked = any(x == rel or x.startswith(rel.rstrip("/") + "/") for x in ix if x)
+        if not os.path.lexists(os.path.join(cwd or os.getcwd(), p)) and not tracked and rel in hs:
+            continue
+        selected.append(p)
+    if not selected:
+        return subprocess.CompletedProcess([], 0, "", "")
+    command = (argv or ["add", "-A"]) + ["--"] + selected
+    if stats is not None:
+        return git_retry(command, stats, env_extra=env, step="add")
+    return git(command, cwd=cwd, env_extra=env)
+
+
+def seed_deleted_for_classic(paths, lit):
+    """Make staged deletions discoverable to git commit --only's path matching.
+
+    Seed just missing HEAD entries; --only stages their working-tree deletion.
+    The caller restores its original snapshot if commit fails.
+    """
+    if not head_sha():
+        return
+    top, _ = repo_info()
+    rels = repo_rel_paths(paths, top)
+    ix = check_step(git(["ls-files", "-z", "--full-name", "--"] + rels, cwd=top, env_extra=lit), "ls-files")
+    existing = set(ix.stdout.split("\0"))
+    tree = check_step(git(["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--"] + rels, cwd=top, env_extra=lit), "ls-tree")
+    entries = []
+    for row in tree.stdout.split("\0"):
+        if not row:
+            continue
+        meta, name = row.split("\t", 1)
+        if name not in existing and not os.path.lexists(os.path.join(top, name)):
+            mode, typ, sha = meta.split()
+            entries.append("%s %s\t%s\0" % (mode, sha, name))
+    if entries:
+        check_step(git(["update-index", "-z", "--index-info"], env_extra=lit,
+                       input="".join(entries)), "seed-deletions")
+
+
+def commit_preview(args, top, lit):
+    """Stage in a copy; one output row per changed path, including both rename ends."""
+    with tempfile.TemporaryDirectory(prefix="wombat-preview-") as tmp:
+        idx = os.path.join(tmp, "index")
+        gp = git_paths(top)
+        if os.path.exists(gp["index"]):
+            shutil.copy2(gp["index"], idx)
+        env = dict(lit, GIT_INDEX_FILE=idx, GIT_OPTIONAL_LOCKS="0")
+        check_step(stage_named(args.paths, env), "preview-add")
+        r = check_step(git(["diff", "--cached", "--no-renames", "--name-status", "-z", "--"] + args.paths,
+                          env_extra=env), "preview-diff")
+        fields = r.stdout.rstrip("\0").split("\0") if r.stdout else []
+        rows = list(zip(fields[::2], fields[1::2]))
+        ren = check_step(git(["diff", "--cached", "--find-renames", "--name-status", "-z", "--"] + args.paths,
+                            env_extra=env), "preview-renames").stdout.split("\0")
+        pairs, i = [], 0
+        while i < len(ren) and ren[i]:
+            if ren[i].startswith("R"):
+                pairs.append((ren[i + 1], ren[i + 2]))
+                i += 3
+            else:
+                i += 2
+        paired = {p for pair in pairs for p in pair}
+        for status, path in rows:
+            print("%s\t%s" % ("R" if path in paired else status, json.dumps(path, ensure_ascii=False)))
+        deleted = sum(s == "D" and p not in paired for s, p in rows)
+        print("wombat-gate: 删 %d / 改名 %d / 改 %d; files=%d; named=%d" %
+              (deleted, len(pairs), len(rows) - deleted - 2 * len(pairs), len(rows), len(args.paths)))
+        if args.expect_files is not None and len(rows) != args.expect_files:
+            eprint("wombat-gate: reviewed file count mismatch; expected %d, found %d" % (args.expect_files, len(rows)))
+            return EXIT_USAGE
+        return EXIT_OK if rows else EXIT_NOTHING
+
 
 def cmd_commit(args):
     t0 = time.monotonic()
@@ -465,15 +593,11 @@ def cmd_commit(args):
            "paths": args.paths[:5], "retries": 0}
 
     if args.dry_run:
-        # No staging: what `add -A` would pick up is exactly the porcelain status of the paths.
-        r = git(["status", "--porcelain", "--untracked-files=all", "--"] + args.paths,
-                env_extra=dict(lit, GIT_OPTIONAL_LOCKS="0"))
-        if r.returncode != 0:
-            eprint(r.stderr.rstrip())
+        try:
+            return commit_preview(args, top, lit)
+        except (GitStepFailed, HeadUnreadable, OSError) as e:
+            eprint("wombat-gate: preview failed:", getattr(getattr(e, "r", None), "stderr", str(e)))
             return EXIT_GIT_ERROR
-        lines = [l for l in r.stdout.splitlines() if l.strip()]
-        print("\n".join(lines) if lines else "wombat-gate: nothing to commit under " + " ".join(args.paths))
-        return EXIT_OK if lines else EXIT_NOTHING
 
     try:
         lk = QueueLock(lock_path_for(common), sess, "commit", args.timeout).__enter__()
@@ -483,7 +607,16 @@ def cmd_commit(args):
     try:
         rec["wait_s"], rec["t_acq"] = lk.wait_s, time.time()
         try:
+            if args.expect_files is not None:
+                rc = commit_preview(args, top, lit)
+                if rc != EXIT_OK:
+                    rec["result"] = "preview_rejected"
+                    return finish_locked(rec, lk, t0, rc)
             why_classic, gp, cfg = classic_reason(args, top)
+            if why_classic is not None:     # the classic path also clears our own leftover lock
+                gpr = gp or git_paths(top)
+                if gpr and os.path.exists(gpr["index"] + ".lock"):
+                    IndexLock(gpr["index"], ticket=lk.path + ".gitlock", session=lk.session).reclaim(rec)
             if why_classic is None:
                 rec["mode"] = "fast"
                 rc = fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg)
@@ -515,7 +648,7 @@ def classic_commit(args, lit, msg, rec, lk, t0):
         return finish_locked(rec, lk, t0, fail_rc(snap))
     snap, head0 = snap.stdout, head_sha()  # None only for an unborn branch
     # 1) stage only the named paths (adds, modifications and deletions under them)
-    r = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="add")
+    r = stage_named(args.paths, lit, stats=rec)
     if r.returncode != 0:
         eprint(r.stderr.rstrip())
         rec["result"] = "add_failed"
@@ -535,11 +668,22 @@ def classic_commit(args, lit, msg, rec, lk, t0):
         rec["result"] = "nothing"
         return finish_locked(rec, lk, t0, EXIT_NOTHING)
     rec["n_files"] = len(changed)
+    if args.expect_files is not None and len(changed) != args.expect_files:
+        eprint("wombat-gate: changed file count moved since preview; nothing committed")
+        timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+        rec["result"] = "count_changed"
+        return finish_locked(rec, lk, t0, EXIT_USAGE)
     # 3) commit only those paths; other staged entries in the index stay staged.
     # A lock collision makes git fail before it writes anything, so a plain retry
     # is safe. (0.2 treated "HEAD moved" as "our commit landed"; HEAD usually
     # moves because the *other* process committed, so that was wrong.)
     argv = ["commit", "-F", "-"] + (["--no-verify"] if args.no_verify else []) + ["--"] + args.paths
+    try:
+        seed_deleted_for_classic(args.paths, lit)
+    except GitStepFailed as e:
+        eprint(e.r.stderr)
+        timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+        return finish_locked(rec, lk, t0, fail_rc(e.r))
     r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
     if r.returncode != 0 and head_after(head0) != head0:
         # A foreign (non-wombat-gate) process committed meanwhile. Either its bare
@@ -558,12 +702,22 @@ def classic_commit(args, lit, msg, rec, lk, t0):
             rec.update(result="swept_by_foreign", foreign_head=head_now[:12])
             return finish_locked(rec, lk, t0, EXIT_NOTHING)
         rec["redo"] = 1
-        ra = git_retry(["add", "-A", "--"] + args.paths, rec, env_extra=lit, step="redo_add")
+        ra = stage_named(args.paths, lit, stats=rec)
         if ra.returncode != 0:
             eprint(ra.stderr.rstrip())
             rec["result"] = "redo_add_failed"
             timed(rec, "restore", restore_index, snap, head0, args.paths, lit)  # HEAD moved: warns, leaves index
             return finish_locked(rec, lk, t0, fail_rc(ra))
+        if args.expect_files is not None:
+            eprint("wombat-gate: HEAD moved after preview; review paths again before retrying")
+            rec["result"] = "head_moved_after_preview"
+            return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+        try:
+            seed_deleted_for_classic(args.paths, lit)
+        except GitStepFailed as e:
+            eprint(e.r.stderr)
+            timed(rec, "restore", restore_index, snap, head0, args.paths, lit)
+            return finish_locked(rec, lk, t0, fail_rc(e.r))
         r = git_retry(argv, rec, env_extra=lit, input=msg, step="commit")
     if r.returncode != 0:
         eprint((r.stdout or "").rstrip())
@@ -841,27 +995,104 @@ class IndexLock:
     the old one (that also releases the lock); release() removes the lock file --
     only if it is still the file we created."""
 
-    def __init__(self, index):
+    def __init__(self, index, ticket=None, session=None):
         self.index, self.path, self.fd, self.ino = index, index + ".lock", None, None
+        self.ticket, self.session = ticket, session
+
+    def _refresh_ticket(self):
+        """commit() writes into the lock file and sets its mtime; record the new mtime so a
+        kill at that point still leaves a lock the next run recognises."""
+        if not self.ticket or self.fd is None and not os.path.exists(self.path):
+            return
+        try:
+            t = read_ticket(self.ticket)
+            if not t or t.get("pid") != os.getpid():
+                return
+            st = os.stat(self.path)
+            t["ino"], t["mtime_ns"] = st.st_ino, st.st_mtime_ns
+            tmp = self.ticket + ".%d" % os.getpid()
+            with open(tmp, "w") as f:
+                json.dump(t, f)
+            os.replace(tmp, self.ticket)
+        except OSError:
+            pass
+
+    def _write_ticket(self):
+        """Note, on the local disk, exactly which lock file we created (inode + mtime), so
+        that if we are killed while holding it the next wombat-gate can recognise it."""
+        if not self.ticket:
+            return
+        try:
+            st = os.fstat(self.fd)
+            tmp = self.ticket + ".%d" % os.getpid()
+            with open(tmp, "w") as f:
+                json.dump({"pid": os.getpid(), "start": proc_start(os.getpid()), "session": self.session,
+                           "lock": self.path, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns,
+                           "t": time.time()}, f)
+            os.replace(tmp, self.ticket)
+        except OSError:
+            pass
+
+    def reclaim(self, rec):
+        """The only lock file wombat-gate ever deletes: one that our ticket says a wombat-gate
+        process created, when that process is dead and the file is still that very file.
+        The caller holds the queue lock, so no other wombat-gate is inside."""
+        t = read_ticket(self.ticket)
+        if not t or t.get("lock") != self.path or not isinstance(t.get("pid"), int) or t.get("pid") == os.getpid():
+            return False                        # a ticket without a proper pid is not trusted
+        if pid_alive(t.get("pid"), t.get("start")):
+            return False
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return True                         # gone meanwhile: just retry
+        if st.st_ino != t.get("ino") or st.st_mtime_ns != t.get("mtime_ns"):
+            return False                        # a different file now: not ours
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        age = time.time() - st.st_mtime
+        rec["stale_lock_removed"] = {"pid": t.get("pid"), "session": t.get("session"), "age_s": round(age, 1)}
+        eprint("wombat-gate: removed %s left by wombat-gate pid %s (%s), which died holding it %.0fs ago"
+               % (self.path, t.get("pid"), t.get("session") or "?", age))
+        write_log({"op": "stale_lock_removed", "lock": self.path, "ticket": t, "age_s": round(age, 1),
+                   "t": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        try:
+            os.remove(self.ticket)
+        except OSError:
+            pass
+        return True
 
     def take(self, rec):
         tries = int(env_float("WOMBAT_GIT_RETRIES", 8))
         delay = env_float("WOMBAT_GIT_BACKOFF", 0.5)
         cap = env_float("WOMBAT_GIT_BACKOFF_MAX", 20)
         t = time.monotonic()
+        reclaimed = False
         try:
-            for i in range(tries + 1):
+            i = 0
+            while i <= tries:
                 try:
                     self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
                     self.ino = os.fstat(self.fd).st_ino
+                    self._write_ticket()
+                    if os.environ.get("WOMBAT_TEST_DIE_HOLDING_LOCK") == "1":   # self-test only
+                        os.kill(os.getpid(), signal.SIGKILL)
                     return True
                 except FileExistsError:
+                    if not reclaimed and self.reclaim(rec):
+                        reclaimed = True
+                        continue
                     if i == tries:
+                        eprint("wombat-gate: %s is still there after %.0fs; run `wombat-gate doctor` to see "
+                               "whose it is" % (self.path, time.monotonic() - t))
                         return False
+                    i += 1
                     rec["retries"] = rec.get("retries", 0) + 1
-                    wait = min(cap, delay * (2 ** i)) * random.uniform(0.7, 1.3)
+                    wait = min(cap, delay * (2 ** (i - 1))) * random.uniform(0.7, 1.3)
                     eprint("wombat-gate: git lock busy (%s exists); retry %d/%d in %.1fs"
-                           % (self.path, i + 1, tries, wait))
+                           % (self.path, i, tries, wait))
                     time.sleep(wait)
         finally:
             steps = rec.setdefault("steps", {})
@@ -888,10 +1119,14 @@ class IndexLock:
         os.fsync(self.fd)
         os.close(self.fd)
         self.fd = None
+        self._refresh_ticket()
         # Keep the private index's mtime: git treats an entry whose file mtime is not
         # older than the index file as "racily clean" and re-reads it. A fresh mtime
         # here would make such entries look clean for good (review 0.6 N1).
         os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self._refresh_ticket()
+        if os.environ.get("WOMBAT_TEST_DIE_WRITING_INDEX") == "1":    # self-test only
+            os.kill(os.getpid(), signal.SIGKILL)
         os.replace(self.path, self.index)
         self.ino = None
 
@@ -901,6 +1136,13 @@ class IndexLock:
             self.fd = None
         if self.mine():
             os.remove(self.path)
+        if self.ino is not None or self.ticket:
+            t = read_ticket(self.ticket)
+            if t and t.get("pid") == os.getpid():
+                try:
+                    os.remove(self.ticket)
+                except OSError:
+                    pass
         self.ino = None
 
 
@@ -944,7 +1186,7 @@ def _fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg):
     msgf = os.path.join(tmpd, "msg.%d" % os.getpid())
     envt = dict(lit, GIT_INDEX_FILE=idx)
     paths_txt = " ".join(args.paths)
-    il = IndexLock(gp["index"])
+    il = IndexLock(gp["index"], ticket=lk.path + ".gitlock", session=lk.session)
     try:
         if not il.take(rec):
             eprint("wombat-gate: %s exists; gave up after %s retries; %s"
@@ -962,7 +1204,7 @@ def _fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg):
         except FileNotFoundError:
             pass  # no index yet (fresh repository)
         rec.setdefault("steps", {})["copy_index"] = time.monotonic() - t
-        check_step(timed(rec, "add", git, ADD_ALL + ["--"] + rels, cwd=top, env_extra=envt), "add")
+        check_step(timed(rec, "add", stage_named, rels, envt, cwd=top, argv=ADD_ALL), "add")
         part = timed(rec, "write_tree", git, ["write-tree"], cwd=top, env_extra=envt)
         if part.returncode != 0:
             # an unmerged or broken entry outside PATH: git commit -- PATH copes, a
@@ -1042,6 +1284,10 @@ def _fast_commit(args, top, lit, msg, rec, lk, t0, gp, cfg):
             dt = check_step(timed(rec, "diff_tree", git, ["diff-tree", "-r", "--no-renames", "--name-status",
                                                           base or EMPTY_TREE, root], cwd=top), "diff_tree")
             changed = [l for l in dt.stdout.splitlines() if l.strip()]
+            if args.expect_files is not None and len(changed) != args.expect_files:
+                eprint("wombat-gate: changed file count moved since preview; nothing committed")
+                rec["result"] = "count_changed"
+                return finish_locked(rec, lk, t0, EXIT_USAGE)
             ct = check_step(timed(rec, "commit_tree", git, ["commit-tree", root] + (["-p", head] if head else [])
                                   + ["-F", msgf], cwd=top), "commit_tree")
             new = ct.stdout.strip()
@@ -1122,6 +1368,168 @@ def restore_index(snap, head0, paths, lit):
     r = git_retry(["update-index", "-z", "--index-info"], {}, input="\0".join(lines) + "\0")
     if r.returncode != 0:
         eprint("wombat-gate: warning: could not restore the index for %s: %s" % (" ".join(paths), r.stderr.strip()))
+
+
+def integration_state(top):
+    gd = check_step(git(["rev-parse", "--absolute-git-dir"], cwd=top), "gitdir").stdout.strip()
+    return any(os.path.exists(os.path.join(gd, name))
+               for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"))
+
+
+def integration_dirty(top, include_ignored=False):
+    env = {"GIT_OPTIONAL_LOCKS": "0", "GIT_LITERAL_PATHSPECS": "1"}
+    tracked = check_step(git(["diff", "--name-only", "-z", "HEAD"], cwd=top, env_extra=env), "dirty-diff")
+    untracked = check_step(git(["ls-files", "--others"] + ([] if include_ignored else ["--exclude-standard"]) + ["-z"],
+                              cwd=top, env_extra=env), "dirty-untracked")
+    return {p for p in (tracked.stdout + untracked.stdout).split("\0") if p}
+
+
+def run_integration_check(command, source, timeout):
+    """Own a process group, so a timed-out check cannot leave worker children."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    proc = subprocess.Popen(command, cwd=source, env=env, start_new_session=True)
+    try:
+        return proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt, Signalled):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        # Children may have ignored TERM even if their parent has already exited.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+
+
+def cmd_integrate(args):
+    old_handlers = {sig: signal.signal(sig, _raise_signalled) for sig in CATCH_SIGNALS}
+    try:
+        return _cmd_integrate(args)
+    except Signalled as e:
+        eprint("wombat-gate: integration stopped by signal %d; inspect the source worktree before retrying" % e.signum)
+        return 128 + e.signum
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+
+
+def _cmd_integrate(args):
+    """Rebase a clean, checked-out local branch, validate, then fast-forward here.
+
+    Both worktrees share the common-dir queue. No checkout/stash/reset/force or
+    worktree deletion. Conflicts stay in the source worktree for human review.
+    """
+    top, common = repo_info()
+    sess, t0 = session_name(args), time.monotonic()
+    rec = {"op": "integrate", "repo": top, "session": sess, "branch": args.rebase, "retries": 0}
+    branch = args.rebase
+    if any(os.environ.get(k) for k in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")):
+        eprint("wombat-gate: integrate refuses Git index/worktree/directory overrides; use normal worktrees")
+        return EXIT_USAGE
+    if branch.startswith("-") or git(["check-ref-format", "refs/heads/" + branch]).returncode:
+        eprint("wombat-gate: give an existing local branch name")
+        return EXIT_USAGE
+    if not args.check:
+        eprint("wombat-gate: integrate requires at least one --check 'command args'")
+        return EXIT_USAGE
+    try:
+        checks = [shlex.split(c) for c in args.check]
+    except ValueError as e:
+        eprint("wombat-gate: invalid --check:", e)
+        return EXIT_USAGE
+    if any(not c for c in checks):
+        eprint("wombat-gate: empty --check")
+        return EXIT_USAGE
+    try:
+        with QueueLock(lock_path_for(common), sess, "integrate", args.timeout) as lk:
+            rec.update(wait_s=lk.wait_s, t_acq=time.time())
+            try:
+                target = check_step(git(["symbolic-ref", "-q", "HEAD"], cwd=top), "target-branch").stdout.strip()
+                if target == "refs/heads/" + branch:
+                    raise ValueError("source and target branches must differ; run from the target worktree")
+                target_sha = head_sha(top)
+                if not target_sha:
+                    raise ValueError("target must have a commit")
+                worktrees = check_step(git(["worktree", "list", "--porcelain", "-z"], cwd=top), "worktrees").stdout
+                source, here = None, None
+                for field in worktrees.split("\0"):
+                    if field.startswith("worktree "):
+                        here = field[9:]
+                    elif field == "branch refs/heads/" + branch:
+                        source = here
+                if source is None:
+                    raise ValueError("source branch must already be checked out in a separate worktree")
+                if integration_state(top) or integration_state(source):
+                    raise ValueError("merge/rebase/cherry-pick/revert in progress; finish or abort it first")
+                if integration_dirty(source):
+                    raise ValueError("source worktree is dirty; commit its files first")
+                source_sha = head_sha(source)
+                base = check_step(git(["merge-base", target_sha, source_sha], cwd=top), "merge-base").stdout.strip()
+                target_changes = set(check_step(git(["diff", "--name-only", "-z", base, target_sha], cwd=top), "target-diff").stdout.split("\0")) - {""}
+                source_ignored = integration_dirty(source, include_ignored=True)
+                if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for p in source_ignored for q in target_changes):
+                    raise ValueError("source has ignored files overlapping target changes; rebase would overwrite them")
+                if check_step(git(["rev-list", "--merges", base + ".." + source_sha], cwd=source), "merge-check").stdout.strip():
+                    raise ValueError("source has merge commits; manual review required before linear rebase")
+                touched = set(check_step(git(["diff", "--name-only", "-z", base, source_sha], cwd=top), "source-diff").stdout.split("\0")) - {""}
+                dirty = integration_dirty(top, include_ignored=True)
+                overlap = sorted(p for p in dirty if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for q in touched))
+                if overlap:
+                    raise ValueError("target has uncommitted files overlapping the branch: " + repr(overlap))
+                if args.dry_run:
+                    print("wombat-gate: rebase %s (%s) onto %s (%s); checks=%s; then ff-only" %
+                          (branch, source, target, target_sha, repr(args.check)))
+                    rec["result"] = "dry_run"
+                    return finish_locked(rec, lk, t0, EXIT_OK)
+                rb = git(["-c", "rebase.autoStash=false", "-c", "rebase.updateRefs=false", "-c", "rebase.autoSquash=false",
+                          "rebase", "--no-autostash", target_sha], cwd=source)
+                if rb.returncode:
+                    eprint(rb.stdout, rb.stderr)
+                    eprint("wombat-gate: rebase stopped in %s; target not advanced. Review there; no automatic conflict resolution." % source)
+                    rec["result"] = "rebase_stopped"
+                    return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+                rebased = head_sha(source)
+                for command in checks:
+                    print("wombat-gate: check in %s: %s" % (source, shlex.join(command) if hasattr(shlex, "join") else repr(command)), flush=True)
+                    rc = run_integration_check(command, source, args.check_timeout)
+                    if rc:
+                        raise ValueError(
+                            "check failed (exit %d); target not advanced; source branch %s was rebased from %s; "
+                            "rebased source retained; revert with: git -C %s reset --hard %s"
+                            % (rc, branch, source_sha, shlex.quote(source), source_sha))
+                if (head_sha(source) != rebased or integration_dirty(source) or integration_state(source)
+                        or git(["symbolic-ref", "-q", "HEAD"], cwd=source).stdout.strip() != "refs/heads/" + branch):
+                    raise ValueError("checks changed source HEAD/worktree; target not advanced")
+                if head_sha(top) != target_sha or git(["symbolic-ref", "-q", "HEAD"], cwd=top).stdout.strip() != target:
+                    raise ValueError("target moved during integration; target not advanced by wombat-gate")
+                if integration_state(top):
+                    raise ValueError("target operation started during checks; target not advanced")
+                dirty = integration_dirty(top, include_ignored=True)
+                if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for p in dirty for q in touched):
+                    raise ValueError("target files now overlap the source; target not advanced")
+                # Git itself rejects any tracked or untracked overwrite; never force.
+                ff = git(["-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", rebased], cwd=top)
+                if ff.returncode:
+                    eprint(ff.stdout, ff.stderr)
+                    rec["result"] = "ff_failed"
+                    return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+                print("wombat-gate: integrated %s -> %s at %s" % (branch, target, rebased))
+                rec.update(result="integrated", commit=rebased, source=source)
+                return finish_locked(rec, lk, t0, EXIT_OK)
+            except (ValueError, GitStepFailed, HeadUnreadable, OSError, subprocess.TimeoutExpired) as e:
+                eprint("wombat-gate: integration stopped:", getattr(getattr(e, "r", None), "stderr", str(e)))
+                rec["result"] = "stopped"
+                return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
+    except TimeoutError:
+        rec.update(result="queue_timeout", total_s=time.monotonic() - t0)
+        return finish(rec, EXIT_LOCK_TIMEOUT)
 
 
 def cmd_status(args):
@@ -1255,7 +1663,190 @@ def cmd_who(args):
     return EXIT_OK
 
 
+def pct(xs, q):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * q
+    lo, hi = int(math.floor(k)), int(math.ceil(k))
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def timing_stats(n=200):
+    try:
+        with open(log_path(), encoding="utf-8") as f:
+            lines = f.readlines()[-max(n, 1) * 3:]
+    except OSError:
+        return None
+    recs = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("op") == "commit" and "wait_s" in r:
+            recs.append(r)
+    recs = recs[-n:]
+    if not recs:
+        return None
+    w = [r.get("wait_s") or 0 for r in recs]
+    h = [r.get("hold_s") or 0 for r in recs if r.get("hold_s") is not None]
+    return {"n": len(recs), "wait_p50": pct(w, .5), "wait_p95": pct(w, .95),
+            "hold_p50": pct(h, .5), "hold_p95": pct(h, .95)}
+
+
+def lock_openers(path):
+    """pids that have `path` open (Linux /proc scan; our own user's processes only)."""
+    out = []
+    real = os.path.realpath(path)
+    for d in os.listdir("/proc") if os.path.isdir("/proc/self") else []:
+        if not d.isdigit():
+            continue
+        try:
+            for fd in os.listdir("/proc/%s/fd" % d):
+                try:
+                    if os.readlink("/proc/%s/fd/%s" % (d, fd)) in (path, real):
+                        out.append(int(d))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+
+def live_git_pids(top):
+    """git processes working in this repository (their cwd is inside it)."""
+    try:
+        r = subprocess.run(["pgrep", "-x", "git"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pids = [int(x) for x in r.stdout.split()]
+    except (OSError, ValueError):
+        return []
+    top = os.path.realpath(top)
+    out = []
+    for p in pids:
+        try:
+            cwd = os.path.realpath(os.readlink("/proc/%d/cwd" % p))
+        except OSError:
+            continue
+        if cwd == top or cwd.startswith(top + os.sep):
+            out.append(p)
+    return out
+
+
+def doctor_items():
+    top, common = repo_info()
+    gitdir = git(["rev-parse", "--absolute-git-dir"]).stdout.strip() or common
+    cands = [os.path.join(gitdir, "index.lock"), os.path.join(gitdir, "HEAD.lock"),
+             os.path.join(common, "HEAD.lock"), os.path.join(common, "packed-refs.lock"),
+             os.path.join(common, "config.lock")]
+    for root, _dirs, files in os.walk(os.path.join(common, "refs")):
+        cands += [os.path.join(root, f) for f in files if f.endswith(".lock")]
+    seen, items = set(), []
+    qpath = lock_path_for(common)
+    ticket = read_ticket(qpath + ".gitlock")
+    gits = live_git_pids(top)
+    stale_after = env_float("WOMBAT_STALE_AFTER", 600)
+    for path in cands:
+        if path in seen or not os.path.exists(path):
+            continue
+        seen.add(path)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        age = time.time() - st.st_mtime
+        rel = os.path.relpath(path, top)
+        openers = lock_openers(path)
+        ours = (ticket and ticket.get("lock") == path and ticket.get("ino") == st.st_ino
+                and ticket.get("mtime_ns") == st.st_mtime_ns)
+        if ours and not pid_alive(ticket.get("pid"), ticket.get("start")):
+            items.append(("warn", "%s: left by wombat-gate pid %s (%s), which died; age %.0fs"
+                          % (rel, ticket.get("pid"), ticket.get("session") or "?", age),
+                          "the next wombat-gate commit removes it automatically"))
+        elif openers:
+            items.append(("info", "%s: in use by pid %s; age %.0fs" % (rel, ", ".join(map(str, openers)), age), ""))
+        elif gits:
+            items.append(("info", "%s: age %.0fs; git is running (pid %s), probably its own lock"
+                          % (rel, age, ", ".join(map(str, gits[:5]))), "wait for it to finish"))
+        elif age > stale_after:
+            items.append(("warn", "%s: looks stale (age %.0fs, nobody has it open, no git running)" % (rel, age),
+                          "a human may remove it: rm '%s'  (agents: do not delete it, ask a human)" % path))
+        else:
+            items.append(("info", "%s: age %.0fs, nobody has it open" % (rel, age),
+                          "if it is still there in %.0f min, it is probably stale" % (stale_after / 60)))
+    if not seen:
+        items.append(("ok", "no git lock files", ""))
+    fd = os.open(qpath, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            held = False
+        except BlockingIOError:
+            held = True
+    finally:
+        os.close(fd)
+    if held:
+        try:
+            with open(qpath + ".holder") as f:
+                h = json.load(f)
+        except (OSError, ValueError):
+            h = {}
+        since = (" for %.0fs" % (time.time() - h["t"])) if isinstance(h.get("t"), (int, float)) else ""
+        items.append(("info", "queue held by %s (%s, pid %s)%s" % (h.get("session", "?"), h.get("op", "?"),
+                                                                  h.get("pid", "?"), since), ""))
+    else:
+        items.append(("ok", "queue free", ""))
+    s = timing_stats()
+    if s:
+        items.append(("info", "last %d commits: queue wait p50 %.2fs / p95 %.2fs; lock hold p50 %.2fs / p95 %.2fs"
+                      % (s["n"], s["wait_p50"], s["wait_p95"], s["hold_p50"] or 0, s["hold_p95"] or 0), ""))
+    return items
+
+
+def cmd_doctor(args):
+    import threading
+    box = {}
+
+    def go():
+        try:
+            box["items"] = doctor_items()
+        except Exception as e:      # noqa: BLE001
+            box["err"] = e
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    th.join(env_float("WOMBAT_DOCTOR_TIMEOUT", 20))
+    if "items" not in box:
+        why = ("error: %s" % box["err"]) if "err" in box else \
+            "the repository did not answer within %.0fs (its disk may be gone)" % env_float("WOMBAT_DOCTOR_TIMEOUT", 20)
+        items = [("bad", why, "check the mount (e.g. `ls` the repository) before anything else")]
+        if args.json:
+            print(json.dumps({"checks": [{"level": l, "message": m, "hint": h} for l, m, h in items]}))
+        else:
+            print("BAD   %s\n      -> %s" % items[0][1:])
+        sys.stdout.flush()
+        os._exit(1)                   # the worker may be stuck in the kernel; do not wait for it
+    items = box["items"]
+    if args.json:
+        print(json.dumps({"checks": [{"level": l, "message": m, "hint": h} for l, m, h in items]},
+                         ensure_ascii=False, indent=1))
+    else:
+        icon = {"ok": "ok  ", "info": "info", "warn": "WARN", "bad": "BAD "}
+        for l, m, h in items:
+            print("%s  %s%s" % (icon[l], m, ("\n      -> " + h) if h else ""))
+    return 1 if any(l in ("warn", "bad") for l, _, _ in items) else EXIT_OK
+
+
 def cmd_log(args):
+    if args.stats:
+        s = timing_stats(args.n if args.n > 20 else 200)
+        if not s:
+            print("(no commit timings yet)")
+            return EXIT_OK
+        print("last %d commits: queue wait p50 %.3fs p95 %.3fs; lock hold p50 %.3fs p95 %.3fs"
+              % (s["n"], s["wait_p50"], s["wait_p95"], s["hold_p50"] or 0, s["hold_p95"] or 0))
+        return EXIT_OK
     if args.n <= 0:
         return EXIT_OK
     try:
@@ -1301,10 +1892,19 @@ def main(argv=None):
                    help="list what would be committed; does not touch the index")
     c.add_argument("-q", "--quiet", action="store_true")
     c.add_argument("--no-verify", action="store_true", help="passed through to git commit")
+    c.add_argument("--expect-files", type=int, help="refuse unless the preview contains exactly N changed file paths")
     c.add_argument("--allow-broad", action="store_true",
                    help="allow '.', the repo root, globs and ':' pathspec magic")
     c.add_argument("paths", nargs="*")
     c.set_defaults(func=cmd_commit)
+
+    it = sub.add_parser("integrate", allow_abbrev=False, help="rebase a branch in its worktree, check, then fast-forward here")
+    common(it)
+    it.add_argument("--rebase", required=True, metavar="BRANCH")
+    it.add_argument("--check", action="append", help="required check command, split as argv without a shell; repeatable")
+    it.add_argument("--check-timeout", type=float, default=600, help="seconds per check (default 600)")
+    it.add_argument("-n", "--dry-run", action="store_true")
+    it.set_defaults(func=cmd_integrate)
 
     s = sub.add_parser("status", allow_abbrev=False, help="short status of the given paths only, without taking index.lock")
     s.add_argument("-u", "--untracked-files", dest="untracked", default="normal",
@@ -1325,7 +1925,12 @@ def main(argv=None):
 
     lg = sub.add_parser("log", allow_abbrev=False, help="print recent timing lines")
     lg.add_argument("-n", type=int, default=20)
+    lg.add_argument("--stats", action="store_true", help="queue wait / lock hold p50 and p95")
     lg.set_defaults(func=cmd_log)
+
+    dr = sub.add_parser("doctor", allow_abbrev=False, help="git lock files in this repository: in use, stale, or ours")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(func=cmd_doctor)
 
     args = p.parse_args(argv)
     old = sorted(k for k in os.environ if k.startswith("GITQ_"))
@@ -1333,6 +1938,12 @@ def main(argv=None):
         eprint("wombat-gate: warning: ignoring %s (gitq was renamed; use WOMBAT_* instead)" % ", ".join(old))
     if not math.isfinite(getattr(args, "timeout", 1)) or getattr(args, "timeout", 1) <= 0:
         eprint("wombat-gate: --timeout must be > 0 seconds")
+        return EXIT_USAGE
+    if getattr(args, "expect_files", None) is not None and args.expect_files < 0:
+        eprint("wombat-gate: --expect-files must be >= 0")
+        return EXIT_USAGE
+    if not math.isfinite(getattr(args, "check_timeout", 1)) or getattr(args, "check_timeout", 1) <= 0:
+        eprint("wombat-gate: --check-timeout must be > 0")
         return EXIT_USAGE
     return args.func(args)
 
