@@ -8,7 +8,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, python: '3.8'}
+          # ubuntu-latest is 26.04 now and setup-python has no 3.8 build for it;
+          # 3.8 is still built for 22.04.
+          - {os: ubuntu-22.04, python: '3.8'}
           - {os: ubuntu-latest, python: '3.13'}
           - {os: macos-latest, python: '3.13'}
     runs-on: ${{ matrix.os }}
