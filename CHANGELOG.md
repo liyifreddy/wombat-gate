@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0 — 2026-11-04 (unreleased)
+
+- Add `claim` / `release` / `claims`: sessions reserve repository-relative paths at the start of work; an overlapping claim by another session (same path, or a parent / child directory, in any worktree of the repository) is refused with the holder's name and exit 7. Claims end with the owning agent process (`$CLAUDE_PID`, `$WOMBAT_OWNER_PID`, or the nearest non-shell ancestor). `commit` notes paths outside your claims or inside someone else's, without blocking.
+- Add `isolate --as NAME [-- PATH...]`: a worktree and branch `wombat/NAME` beside the repository, registered next to the queue lock; `isolate --done` / `integrate --done` remove it only when clean and merged (no force; branch deleted against its verified sha).
+- `integrate` no longer holds the queue during rebase and checks (W1): it takes the queue briefly to snapshot the target and again to fast-forward; if the target moved, it rebases and checks again up to `--attempts` (default 3, `WOMBAT_INTEGRATE_ATTEMPTS`). `--as NAME` picks the isolated branch; a stopped rebase lists the conflicting files.
+- `--as` is accepted as an alias of `--session`.
+- New `selftest_isolate.py` (23 tests).
+
 ## 0.8.0 — 2026-11-04 (unreleased)
 
 - Commit already-staged deletions and both ends of renames, including Unicode paths, in fast and classic modes while keeping unrelated staging.

@@ -13,6 +13,10 @@ burrow at a time) and commits only the paths you name.
 
 ## Do
 
+- At the start, reserve the paths your task gives you:
+  `wombat-gate claim --as <your session name> -- <paths>`. Exit 7 means another
+  session already holds an overlapping path (stderr says who): stop and report, do not
+  work around it. When you have handed in, `wombat-gate release --as <name>`.
 - Commit: `wombat-gate commit -m "<message>" -- <your files or directories>`
   - name only your own paths; a directory covers everything under it;
   - long message: write it to a file and use `wombat-gate commit -F <file> -- <paths>`;
@@ -48,6 +52,7 @@ burrow at a time) and commits only the paths you name.
 | 4 | waited too long in the queue (`--timeout`, default 600 s) | run `wombat-gate who`, wait, retry later |
 | 5 | a git process that does not use wombat-gate kept a lock, or other commits kept landing while we built ours | report it with the message; do not delete the lock |
 | 6 | committed (the sha is printed), but writing the index failed afterwards, so it still has the old entries for your paths | report the disk error; once the disk is fine run the same `wombat-gate commit` again: it repairs the index and exits 3. Never commit the "staged" old versions |
+| 7 | `claim` / `isolate`: another session holds an overlapping path; nothing was claimed | stop and report who holds it (it is in stderr); do not take the path anyway |
 
 If two agents commit the same path, the first commit takes both agents'
 changes; the second gets exit 3. Keep to your own paths.
@@ -56,6 +61,10 @@ changes; the second gets exit 3. Keep to your own paths.
 
 For a move, name the old and new paths even if Git already staged the rename/deletion. Run `wombat-gate commit -n --expect-files N -m MESSAGE -- PATH...`, review the one-row-per-path output, then use the same N and path list for the real commit. A rename contributes two paths but one rename pair. Directory parameters expand, so use the expanded file count. Stop on count mismatch. No reset of staged deletions is needed.
 
-From the target worktree, integrate a reviewed committed branch with `wombat-gate integrate --rebase BRANCH --check 'python3 tests/run_all.py'`. Repeat `--check` for every task-required check. The clean source must already have its own worktree. On conflict stop and report the source path; the rebase remains there. On failed checks the rebased source is retained and the target is not advanced. Never remove branches/worktrees as cleanup. Use the project's permission rules before integration, pushing or publishing.
+From the target worktree, integrate a reviewed committed branch with `wombat-gate integrate --rebase BRANCH --check 'python3 tests/run_all.py'`. Repeat `--check` for every task-required check. The clean source must already have its own worktree. Other sessions keep committing while the checks run; if the target moves, integrate rebases and checks again by itself (up to `--attempts`). On conflict stop and report the source path and the conflicting files it lists; the rebase remains there. On failed checks the rebased source is retained and the target is not advanced. Use the project's permission rules before integration, pushing or publishing.
+
+## Your own worktree (0.9)
+
+When your task says to work isolated (several sessions on the same code), run from the main checkout `wombat-gate isolate --as <name> [-- <paths>]`, `cd` into the printed directory, and commit there with `wombat-gate commit --as <name> ...`. To hand in, from the main checkout: `wombat-gate integrate --as <name> --check '<required check>' --done` — it rebases, checks, fast-forwards and then removes your worktree and branch. Never remove branches or worktrees by hand (`git worktree remove`, `git branch -D`, `rm -rf`); if `--done` refuses, report its message.
 
 For Codex and OpenCode, put these rules in project AGENTS.md and start the CLI with `WOMBAT_NO_ESCAPES=1 WOMBAT_SESSION=<task>`. This installs instructions, not a shell guard. The Claude Code plugin supplies its own Bash guard hook. See the README for configuration examples and platform limits.

@@ -194,16 +194,38 @@ punctuation, redirections and their fd numbers dropped, `bash -c` / `eval` /
 `$(...)` recursed into, heredoc bodies removed) and checks git's actual argument
 structure (global options, short-option clusters, option values, pathspecs).
 
-## 2. Session registry (design only — not built)
+## 2. Path claims (0.9, implemented) and host leases (design only)
 
-**Problem.** Besides git, agents sharing a machine pool collide on *resources*:
-two agents start jobs on the same remote box, or edit the same directory.
-Today this is coordinated by a human-maintained table in a document, which goes
-stale.
+**Problem.** Agents in one checkout collide on *paths* long before git does: two
+agents edit the same directory, and the clash only shows when the second commit
+sweeps up both changes or a merge conflicts. Agents sharing a machine pool also
+collide on *resources* (two agents start jobs on the same remote box). Both were
+coordinated by a human-maintained table in a document, which goes stale.
 
-**Goal.** A small, local, append-only lease registry that agents query before
-acting, and that a human can read at a glance. Advisory, like the git queue:
-it informs and warns; enforcement stays with hooks and humans.
+### Path claims as built (0.9)
+
+- `claim --as NAME -- PATH...` registers repository-relative paths for a session;
+  overlap = equal paths or one above the other. All or nothing: one overlapping
+  path refuses the whole request (exit 7) and names the holder. Advisory, like the
+  queue: `commit` only prints notes; enforcement stays with task cards and humans.
+- **Lifetime = the agent process, not a TTL.** Each claim records the owner process
+  (`$WOMBAT_OWNER_PID`, `$CLAUDE_PID`, else the nearest non-shell ancestor) with its
+  start time; the claim is dropped as soon as anyone reads the registry after that
+  process is gone or its pid was reused. Agents that wait for hours keep their claims
+  without renewing; a crashed agent frees them at once. This is the same "is the
+  owner alive" test dingo-pack's roster uses. The price: claims made without an
+  owner process (human shell under tmux/ssh, macOS) live until `release`.
+- Storage: one small JSON document per repository next to the queue lock
+  (`<repo>-<hash>.claims.json`), keyed by the git common dir so all worktrees share
+  it, rewritten atomically under its own short `flock`. Current state only; the
+  timing log is not used as an audit trail for claims.
+- Identity is self-declared (`--as` / `$WOMBAT_SESSION`); claim / release / isolate
+  refuse the `pid…` fallback name. Not a security boundary.
+
+### Host leases (design only — not built)
+
+The rest of this section is the original lease design for remote machines; path
+claims above replaced its `path` kind.
 
 ### Data model
 
@@ -262,8 +284,6 @@ wombat-gate lease show    [--kind KIND] [--json]
 
 ### Integration points
 
-- `wombat-gate commit` could warn (not refuse) when a committed path lies under a
-  `path` lease held by another session.
 - A `PreToolUse` hook can call `wombat-gate lease check host <name>` before commands
   that start or kill jobs on a remote host (e.g. matching `ssh <host> ... tmux
   new` / `kill`), turning the human table into a mechanical check.
@@ -290,6 +310,49 @@ wombat-gate lease show    [--kind KIND] [--json]
 
 Preview stages in an index copy, reads NUL-separated diff records, identifies rename pairs with Git's rename detection and prints one JSON-quoted row per path. `--expect-files` verifies the reviewed count inside the queue and again at the final selected diff; it does not turn a directory argument into a single file. Unrelated staged entries are neither displayed nor committed. Counts are not a content-approval signature: review changes immediately before committing and coordinate other processes touching the same paths.
 
-`integrate` deliberately requires two existing worktrees rather than checking out a branch in the target's shared working tree. It verifies source cleanliness, operation state, branch identity, dirty target overlap (including ignored files) and a common merge base. Linear rebase runs in the source with auto-stash, auto-squash and updateRefs disabled. Required argv-based checks run there under the queue with individual timeouts; checks must leave the source clean. The target is checked again, then Git performs an unforced fast-forward. Conflicts remain in the source for review; failed checks keep the rebased branch without advancing the target. There is no rollback that could overwrite somebody else's work, and no worktree/branch cleanup. Foreign writers remain outside the cooperative queue.
+`integrate` deliberately requires two existing worktrees rather than checking out a branch in the target's shared working tree. It verifies source cleanliness, operation state, branch identity, dirty target overlap (including ignored files) and a common merge base. Linear rebase runs in the source with auto-stash, auto-squash and updateRefs disabled. Required argv-based checks run there with individual timeouts; checks must leave the source clean. The target is checked again, then Git performs an unforced fast-forward. Conflicts remain in the source for review; failed checks keep the rebased branch without advancing the target. There is no rollback that could overwrite somebody else's work. Foreign writers remain outside the cooperative queue. Lock scope and clean-up are in section 3.
 
 Lock interval validation uses monotonic acquisition/release timestamps in addition to wall-clock log fields. WSL wall time was observed stepping backwards between sequential commits by the same writer; it cannot prove queue overlap.
+
+## 3. Isolated worktrees and integrate without the queue (0.9)
+
+**Why worktrees alone are not enough.** One worktree per agent (the OpenCode / Codex
+model) keeps agents apart while they type, but two agents that edit the same code
+still meet at merge time, and someone has to create, merge and delete the worktrees
+by hand. 0.9 keeps that isolation and adds the three things around it: overlap is
+reported when work starts (`isolate -- PATH...` claims first), hand-in is a checked
+rebase + fast-forward, and clean-up is a command that refuses to lose work.
+
+**`isolate`.** Branch `wombat/<name>` at the target's HEAD, worktree at
+`<main worktree>.wombat/<name>` (beside the repository, so tools that scan the
+repository do not walk into it). The entry (session, branch, path, target branch,
+base, owner) goes into `<repo>-<hash>.isolates.json` under the registry lock; the
+`git worktree add` itself runs under the queue lock because it writes refs. Isolated
+worktrees are never pruned automatically, unlike claims: the directory may hold
+commits nobody integrated yet.
+
+**`--done`.** Order: refuse from inside the worktree; refuse a rebase/merge in
+progress, uncommitted or untracked files, or a branch that is not an ancestor of the
+target branch; then `git worktree remove` without `--force` (git re-checks
+cleanliness), then `git update-ref -d refs/heads/<branch> <sha>` so a commit that
+lands on the branch after the check makes the delete fail instead of losing it.
+Ignored files go with the worktree (caches from the checks would otherwise block
+every clean-up); they are listed.
+
+**W1: the queue is not held during rebase and checks.** 0.8 held the repository's
+queue for the whole integration; with a 10-minute check every other session's
+commit waited, and timed out at the default 600 s (found in an independent review).
+The queue protects the *target* worktree's index and HEAD; rebase and checks touch
+only the source worktree (its own index, its own branch ref, shared objects that
+git writes atomically). So 0.9 holds the queue only for:
+
+1. a snapshot: validate both worktrees, note target branch + sha;
+2. the hand-over: target branch, sha and operation state unchanged, no dirty target
+   path overlapping the rebased changes → `merge --ff-only`.
+
+If the target moved in between, the checks validated a tree that is no longer what
+would land, so the round is discarded: rebase onto the new target, check again, up
+to `--attempts` (default 3). A busy target with long checks can exhaust the attempts;
+that ends with exit 1, the target untouched and the original source sha printed. The
+first snapshot keeps 0.8's behaviour that a queue timeout leaves the source branch
+untouched.

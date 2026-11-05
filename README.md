@@ -115,9 +115,30 @@ wombat-gate run -- git push                    # push, fetch, tag, log, ... (an 
 wombat-gate who                                # who is in the burrow
 wombat-gate log -n 50                          # recent timings (--stats: p50 / p95)
 wombat-gate doctor                             # git lock files: in use, stale, or ours
+wombat-gate claim --as agent-7 -- src/parser   # reserve your paths at start; overlaps are refused (exit 7)
+wombat-gate claims                             # who reserved what, and the isolated worktrees
+wombat-gate release --as agent-7               # hand the paths back when you are done
+wombat-gate isolate --as agent-7               # your own worktree + branch beside the repo
+wombat-gate integrate --as agent-7 --check 'make test' --done   # rebase, check, fast-forward, clean up
 ```
 
-Set `WOMBAT_SESSION=agent-7` (or `--session`) so `who` can tell you who is in there.
+Set `WOMBAT_SESSION=agent-7` (or `--session` / `--as`) so `who` can tell you who is in there.
+
+## 🔀 Three ways to work: which one to pick (0.9)
+
+| Your situation | Use | What happens |
+|---|---|---|
+| Small edits, agents on different files, one shared checkout | `commit -- <paths>` only | Commits queue through one lock; each takes only its own paths. |
+| Agents in parallel on **separate** parts of one checkout | `claim` at start, `release` at the end | The second agent to claim an overlapping path (same path, or a parent / child directory) is told at once who holds it and gets exit 7 — before anyone writes a line. `commit` notes paths outside your claims. |
+| Agents in parallel on the **same** code | `isolate`, then `integrate --done` | Each agent gets its own worktree and branch beside the repo. Hand-in rebases onto the current target, runs your checks, fast-forwards, then removes the worktree and the merged branch. A conflict stops in that agent's worktree and lists the files. |
+
+**Compared with "one worktree per agent"** (what OpenCode, Codex and similar tools offer): their worktrees keep agents apart while they work, and the collision shows up at merge time. wombat-gate adds three things:
+
+1. **Overlap is reported at the start.** `claim` (and `isolate -- <paths>`) checks every live session's reservations across all worktrees of the repository, so two agents heading for the same directory find out before they start, not when merging.
+2. **Hand-in is checked.** `integrate` rebases onto the target as it is *now*, runs the required checks, and fast-forwards only if the target has not moved since; if it has, it rebases and checks again (`--attempts`, default 3). The queue is held only for a moment at the start and at the fast-forward, so other agents keep committing during long checks.
+3. **Clean-up is automatic and safe.** `--done` removes the worktree and deletes the branch only when the branch is merged and the worktree is clean; nothing is forced.
+
+Reservations of a session whose agent process has exited are dropped the next time anyone looks; isolated worktrees are never dropped automatically (they may hold work) — `claims` marks their owner as gone.
 Exit codes, settings and every refused command are in the [reference](REFERENCE.md).
 
 ## 🤖 With Claude Code
@@ -141,8 +162,9 @@ chains and unattended runs.
 - Only processes that use wombat-gate queue. Switch every agent over.
 - The lock must be on a local disk. Windows-side git can't see a WSL lock.
 - Commits get fast; `git status` and `git log` on a slow disk don't.
-- Two agents changing the same file: the first commit takes both changes. Give agents
-  separate paths.
+- Two agents changing the same file in one checkout: the first commit takes both changes.
+  Give agents separate paths (`claim`), or separate worktrees (`isolate`).
+- Claims are advisory: they warn and refuse overlapping claims, but do not stop a commit.
 - One machine only.
 
 The full list is in the [reference](REFERENCE.md#limits-in-full).
@@ -153,13 +175,16 @@ The full list is in the [reference](REFERENCE.md#limits-in-full).
 python3 selftest_wombat_gate.py               # 1–7 min depending on load, throw-away repos on a local disk
 python3 selftest_wombat_gate.py --mutants     # 44 past bugs put back; each must turn a check red
 bash hooks/selftest_guard.sh                  # 197 commands the guard must block or let through
+python3 selftest_release.py                   # 0.8 regressions: deletions, renames, integrate (25)
+python3 selftest_isolate.py                   # 0.9: claims, isolated worktrees, integrate without holding the queue (23)
 ```
 
 Every fast commit is compared with what plain `git commit` does on a copy of the repo.
 
 ## 📍 Status
 
-- 0.8.0 candidate — staged deletion/rename support, reviewed file counts, checked worktree integration and release checks. See [CHANGELOG](CHANGELOG.md).
+- 0.9.0 candidate — `claim` / `release` / `claims`, `isolate` worktrees with `integrate --done`, and `integrate` no longer holds the queue during rebase and checks.
+- 0.8.0 — staged deletion/rename support, reviewed file counts, checked worktree integration and release checks. See [CHANGELOG](CHANGELOG.md).
 
 - 0.7.0 — cleans up its own stale `index.lock`; `doctor`; timing p50 / p95.
 - 0.6.2 — before / after picture, language switch.
@@ -183,18 +208,19 @@ wombat-gate commit    --expect-files 2 -m 'rename notes' -- '旧目录/笔记.md
 
 The preview shows one row per changed **path**, with both ends of a rename on separate rows. Filenames are JSON-quoted UTF-8, so embedded newlines cannot create extra rows. The summary `删 N / 改名 N / 改 N` means deleted paths excluding rename sources / rename pairs / other changed paths (including additions). A rename is two rows but one pair. `--expect-files N` checks the count again under the queue lock and refuses mismatches (exit 2); use the number of explicitly named changed files for a move. Directories expand recursively, so use the expanded file count rather than the number of directory arguments. Without the flag, the original recursive commit API remains available. Other agents' staging stays outside the selected paths.
 
-## Integrate a worktree branch (0.8)
+## Integrate a worktree branch
 
 From the **target** worktree, rebase the committed source branch onto the current target HEAD, run the named checks in the source worktree, then fast-forward:
 
 ```sh
 wombat-gate integrate -n --rebase topic --check 'python3 tests/run_all.py'
 wombat-gate integrate    --rebase topic --check 'python3 tests/run_all.py' --check 'python3 tests/regression.py'
+wombat-gate integrate    --as agent-7   --check 'python3 tests/run_all.py' --done   # a worktree made by isolate
 ```
 
-The source must already be checked out in a separate worktree and have no tracked changes or nonignored untracked files. At least one `--check` is required. Commands are split into argv without a shell: no pipes, redirection or shell expansion; `--check-timeout` defaults to 600 seconds per command. The repository's common queue covers rebase, checks and fast-forward. The target may have unrelated staged/unstaged work; overlapping tracked, untracked or ignored paths are refused. Ignored source files that target changes would overwrite are also refused. Checks must leave source HEAD and tracked/nonignored files unchanged.
+The source must already be checked out in a separate worktree and have no tracked changes or nonignored untracked files. At least one `--check` is required. Commands are split into argv without a shell: no pipes, redirection or shell expansion; `--check-timeout` defaults to 600 seconds per command. The repository's common queue is held twice, briefly: to validate and note the target, and to fast-forward once the target is confirmed unchanged. Rebase and checks run outside it, so other sessions keep committing; if the target moved meanwhile, integrate rebases and checks again, up to `--attempts` (default 3, or `WOMBAT_INTEGRATE_ATTEMPTS`). The target may have unrelated staged/unstaged work; overlapping tracked, untracked or ignored paths are refused. Ignored source files that target changes would overwrite are also refused. Checks must leave source HEAD and tracked/nonignored files unchanged.
 
-Conflicts stop in the source worktree with the rebase state preserved; inspect it there and explicitly continue or abort before retrying. Failed checks leave the rebased source branch available and do not advance the target. Source branches containing merge commits require manual review. A changed target HEAD, an in-progress operation or unsafe overlap stops integration. There is no automatic stash, force update, conflict resolution, branch deletion or worktree deletion. Only cooperating processes share the queue; ordinary Git processes still need coordination.
+Conflicts stop in the source worktree with the rebase state preserved; inspect it there and explicitly continue or abort before retrying. Failed checks leave the rebased source branch available and do not advance the target. Source branches containing merge commits require manual review. A target that keeps moving past the attempt limit, a target that switched branch, an in-progress operation or unsafe overlap stops integration. There is no automatic stash, force update or conflict resolution. Branches and worktrees are removed only by `--done` (or `isolate --done`), only for a worktree made by `isolate`, and only when its branch is merged and the worktree is clean; ignored files inside it (caches, build output) go with it. Only cooperating processes share the queue; ordinary Git processes still need coordination.
 
 ## Platform status
 
@@ -218,7 +244,7 @@ The CLI works independently of a model/provider. These examples provide instruct
 ```
 
 ```text
-Commit only assigned files through wombat-gate. Preview a move with --expect-files N, name both old and new paths, and use the same count for the real commit. Stop if the file list differs. Integrate only a reviewed branch with the task's required --check commands. Ask before pushing or publishing when the task requires approval.
+At start, claim your assigned paths with `wombat-gate claim --as <session> -- <paths>` and stop if it reports an overlap; release them when done. Commit only assigned files through wombat-gate. Preview a move with --expect-files N, name both old and new paths, and use the same count for the real commit. Stop if the file list differs. Integrate only a reviewed branch with the task's required --check commands. Ask before pushing or publishing when the task requires approval.
 ```
 
 **Codex:** put that same rule in the repository's `AGENTS.md` ([official instructions guide](https://learn.chatgpt.com/docs/agent-configuration/agents-md)). Start it with:

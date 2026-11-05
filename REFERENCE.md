@@ -132,6 +132,9 @@ and exits 1; it does not guess that someone else moved it.
 | `WOMBAT_COMMIT_MODE` | `fast` | `classic` = always use `git add` + `git commit` on the shared index |
 | `WOMBAT_NO_ESCAPES` | unset | `1` = treat this process as an agent |
 | `WOMBAT_HUMAN_OVERRIDE` | unset | `1` = a human allows the escape hatches |
+| `WOMBAT_OWNER_PID` | unset | the agent process a claim / isolate belongs to (else `$CLAUDE_PID`, else the nearest non-shell ancestor) |
+| `WOMBAT_ISOLATE_ROOT` | `<repo>.wombat` beside the main worktree | parent directory of isolated worktrees (also `isolate --dir`) |
+| `WOMBAT_INTEGRATE_ATTEMPTS` | `3` | rebase + check rounds when the target keeps moving (also `integrate --attempts`, must be ≥ 1) |
 
 The lock is per repository (keyed by the real path of its git common dir), so
 linked worktrees of one repository share one queue.
@@ -165,7 +168,8 @@ Exit codes: `0` ok · `1` git error · `2` usage / refused · `3` nothing to com
 under the given paths · `4` timed out waiting in the queue · `5` a foreign git
 lock never cleared (or `HEAD` kept moving) · `6` committed, but writing the
 index failed afterwards (a disk error) — run the same command again once the disk
-is fine; it repairs the index and exits 3.
+is fine; it repairs the index and exits 3. · `7` another session has claimed an overlapping
+path (`claim`, `isolate -- PATH...`).
 
 ## The guard hook
 
@@ -266,7 +270,13 @@ Without the plugin, use the hook directly: add to `.claude/settings.json`
   `tmux new -d "..."` on a server a human launched) runs without `CLAUDECODE`.
   Set `WOMBAT_NO_ESCAPES=1` in that server's environment too
   (`tmux set-environment -g WOMBAT_NO_ESCAPES 1`).
-- **Same path, two agents:** the first commit takes both agents' changes.
+- **Same path, two agents:** the first commit takes both agents' changes. `claim`
+  reports such overlaps at the start, but it is advisory: `commit` only prints a
+  note for paths outside your claims, it does not refuse them.
+- **Claims follow the agent process.** Without `$CLAUDE_PID` / `$WOMBAT_OWNER_PID`
+  the owner is the nearest ancestor that is not a shell; a claim made from a human
+  shell under tmux / ssh, or on macOS (no `/proc`), has no owner and stays until
+  `release`.
 - **Fairness:** waiters block in `flock(2)`; the kernel does not promise strict
   first-come-first-served, but at millisecond hold times nobody starves.
 - Uses `SIGALRM` while waiting; only matters if you import it as a module.
@@ -304,6 +314,47 @@ the tool.
 
 `commit [-n] --expect-files N -m MESSAGE -- PATH...` verifies N changed paths, including two paths for each rename. The preview prints one row per path and the deletion / rename-pair / other-change counts. A mismatch exits 2. Directory arguments expand recursively; N is the expanded path count. Already-staged deletions need no manual reset; name both ends of a rename. The original commit API without `--expect-files` retains its recursive behavior. The dry run stages only an index copy and leaves the shared index untouched.
 
-`integrate [-n] --rebase BRANCH --check 'COMMAND ARG...' [--check ...] [--check-timeout SECONDS] [--timeout SECONDS] [--session NAME]` runs from the target worktree. BRANCH must be a local branch checked out cleanly in another existing worktree. Checks are required, argv-based (no shell), executed in that source worktree, and individually limited to 600 seconds by default. The common queue covers the whole operation. Target dirty overlap (including ignored files), source merge commits, operation state, conflict, failed checks or changed HEAD stop integration. On conflict the rebase state remains in the source; on check failure the rebased source remains and target is not advanced. No worktree or branch is removed. Exit 0 means integrated (or dry-run), 1 means stopped/error, 2 means invalid usage, 4 means queue timeout. A nonzero result does not imply that the source rebase was undone.
+`integrate [-n] (--rebase BRANCH | --as NAME) --check 'COMMAND ARG...' [--check ...] [--check-timeout SECONDS] [--attempts N] [--done] [--timeout SECONDS]` runs from the target worktree. BRANCH must be a local branch checked out cleanly in another existing worktree; with `--as NAME` and no `--rebase`, it is the branch `isolate --as NAME` made. Checks are required, argv-based (no shell), executed in that source worktree, and individually limited to 600 seconds by default. The queue is held only to validate and note the target, and again to fast-forward (see [0.9 additions](#09-additions)). Target dirty overlap (including ignored files), source merge commits, operation state, conflict, failed checks, a target that switched branch or kept moving past `--attempts` stop integration. On conflict the rebase state remains in the source and the conflicting files are listed; on check failure the rebased source remains and target is not advanced. Worktrees and branches are removed only with `--done`. Exit 0 means integrated (or dry-run), 1 means stopped/error, 2 means invalid usage, 4 means queue timeout. A nonzero result does not imply that the source rebase was undone.
 
 Platform and agent setup: [English README](README.md#platform-status). Release account setup: [publishing](docs/PUBLISHING.md). The original Linux-specific diagnostic suite is not the macOS portable regression suite.
+
+## 0.9 additions
+
+### Claims
+
+```sh
+wombat-gate claim   --as NAME -- PATH...      # reserve; all or nothing
+wombat-gate release --as NAME [-- PATH...]    # all of NAME's claims, or the named ones (exact paths)
+wombat-gate claims  [--json]                  # claims and isolated worktrees of this repository
+```
+
+- Paths go through the same guard as `commit` (literal, inside the repository, not the root) and are stored repository-relative, so every worktree of a repository sees the same claims.
+- Two paths overlap when they are equal or one is a directory above the other (`src` and `src/a/f.txt`). A session never conflicts with itself; claiming again under the same name widens the claim and makes the current process its owner.
+- If any requested path overlaps a live claim of another session, nothing is claimed; stderr lists each pair, who holds it, since when and its owner process. Exit **7**.
+- `release` with nothing to release exits 3. `--as` is an alias of `--session`; without either, `$WOMBAT_SESSION` is used; claim / release / isolate refuse to run without a name (exit 2).
+- `commit` (and `commit -n`) prints `note:` lines when the repository has live claims: a path inside another session's claim (names the session), or, if you hold claims, a path outside them. It never blocks.
+
+### Isolated worktrees
+
+```sh
+wombat-gate isolate --as NAME [--dir PARENT] [-- PATH...]   # from the target worktree
+wombat-gate isolate --as NAME --done                         # after the branch is merged
+```
+
+- Creates branch `wombat/<NAME>` at the current HEAD and a worktree at `<PARENT>/<NAME>` (default parent: `<main worktree>.wombat`, beside the repository, or `$WOMBAT_ISOLATE_ROOT`). Characters not allowed in ref names become `-`. Running it again for the same name prints the existing worktree. With paths, they are claimed first; an overlap (exit 7) means no worktree is made.
+- Refuses when the branch or the directory already exists without being registered for NAME, when run from a detached HEAD or an unborn branch.
+- `--done` (and `integrate --done`) removes the worktree with `git worktree remove` (no `--force`, so git re-checks it is clean) and deletes the branch with `git update-ref -d` against the sha it just verified is an ancestor of the target branch. It stops on uncommitted or untracked files, a rebase/merge in progress, or an unmerged branch (exit 1), and refuses to run from inside the worktree it removes (exit 2). Ignored files in the worktree are removed with it and listed. The session's claims are released.
+- Isolated worktrees are never removed automatically. `claims` shows each with its owner process and `[worktree missing]` if the directory is gone; `isolate --done` then just clears the entry (and the branch, if merged).
+
+### Integrate without holding the queue (W1)
+
+1. Take the queue lock; validate both worktrees; note the target branch and sha; release.
+2. Without the lock: `git rebase` the source onto the noted sha; run the checks.
+3. Take the queue lock; if the target branch, its sha and its operation state are unchanged and no dirty target path overlaps the source changes, `merge --ff-only`; release.
+4. If the target sha moved, print `target moved during checks (...); rebasing again (attempt k of N)` and go back to 1. After N attempts (default 3) stop with exit 1; the target is not advanced and the message carries the original source sha for `reset --hard`.
+
+Other sessions' commits proceed during step 2. The timing log records `attempts`, `retries` (rounds caused by a moving target) and `hold_s` (both short holds added together).
+
+### Registry files
+
+Beside the queue lock, in `$WOMBAT_LOCK_DIR`: `<repo>-<hash>.claims.json`, `<repo>-<hash>.isolates.json` and `<repo>-<hash>.registry.lock` (a short `flock` around each read-modify-write). Each entry records the session, path or branch, time, host, and owner pid + process start time. A claim whose owner (same host) has exited, or whose pid now belongs to another process, is removed the next time any `claim` / `release` / `claims` runs, with a `cleared stale claim` note.

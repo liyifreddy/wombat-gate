@@ -17,6 +17,10 @@ Subcommands:
   wombat-gate log [-n N] [--stats]                               recent timing lines / p50 and p95
   wombat-gate doctor [--json]                                    git lock files: who holds them, are they stale
   wombat-gate integrate --rebase BRANCH --check COMMAND           rebase, validate, fast-forward worktrees
+  wombat-gate claim --as NAME -- PATH...                         reserve paths; overlaps are reported at once
+  wombat-gate release --as NAME [-- PATH...]                     drop your reservations
+  wombat-gate claims [--json]                                    who reserved what; isolated worktrees
+  wombat-gate isolate --as NAME [-- PATH...] | --done            own worktree + branch beside the repo
 
 Standard library only. Python >= 3.8, Linux/macOS/WSL (needs fcntl).
 """
@@ -42,7 +46,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 EXIT_OK = 0
 EXIT_GIT_ERROR = 1
@@ -51,6 +55,7 @@ EXIT_NOTHING = 3          # nothing to commit in the given paths
 EXIT_LOCK_TIMEOUT = 4     # could not get the wombat-gate queue lock in time
 EXIT_GIT_LOCK_BUSY = 5    # a foreign git process kept a git lock past all retries
 EXIT_INDEX_STALE = 6      # committed, but the shared index could not be updated for the paths
+EXIT_CLAIMED = 7          # another session has reserved an overlapping path (claim / isolate)
 
 # The one message git prints when another process holds one of its lock files
 # (index.lock, HEAD.lock, refs/.../x.lock, config.lock all use it). Anything else
@@ -591,6 +596,8 @@ def cmd_commit(args):
     sess = session_name(args)
     rec = {"op": "commit", "session": sess, "repo": top, "n_paths": len(args.paths),
            "paths": args.paths[:5], "retries": 0}
+    if not args.allow_broad:
+        claim_hint(common, top, sess, args.paths)
 
     if args.dry_run:
         try:
@@ -1420,19 +1427,77 @@ def cmd_integrate(args):
             signal.signal(sig, handler)
 
 
+def _integrate_snapshot(top, branch):
+    """Validate both worktrees and note where the target stands. Called under the queue lock."""
+    target = check_step(git(["symbolic-ref", "-q", "HEAD"], cwd=top), "target-branch").stdout.strip()
+    if target == "refs/heads/" + branch:
+        raise ValueError("source and target branches must differ; run from the target worktree")
+    target_sha = head_sha(top)
+    if not target_sha:
+        raise ValueError("target must have a commit")
+    source = next((p for p, b in list_worktrees(top) if b == "refs/heads/" + branch), None)
+    if source is None:
+        raise ValueError("source branch must already be checked out in a separate worktree")
+    if integration_state(top) or integration_state(source):
+        raise ValueError("merge/rebase/cherry-pick/revert in progress; finish or abort it first")
+    if integration_dirty(source):
+        raise ValueError("source worktree is dirty; commit its files first")
+    source_sha = head_sha(source)
+    base = check_step(git(["merge-base", target_sha, source_sha], cwd=top), "merge-base").stdout.strip()
+    target_changes = set(check_step(git(["diff", "--name-only", "-z", base, target_sha], cwd=top), "target-diff").stdout.split("\0")) - {""}
+    source_ignored = integration_dirty(source, include_ignored=True)
+    if any(paths_overlap(p, q) for p in source_ignored for q in target_changes):
+        raise ValueError("source has ignored files overlapping target changes; rebase would overwrite them")
+    if check_step(git(["rev-list", "--merges", base + ".." + source_sha], cwd=source), "merge-check").stdout.strip():
+        raise ValueError("source has merge commits; manual review required before linear rebase")
+    touched = set(check_step(git(["diff", "--name-only", "-z", base, source_sha], cwd=top), "source-diff").stdout.split("\0")) - {""}
+    dirty = integration_dirty(top, include_ignored=True)
+    overlap = sorted(p for p in dirty if any(paths_overlap(p, q) for q in touched))
+    if overlap:
+        raise ValueError("target has uncommitted files overlapping the branch: " + repr(overlap))
+    return {"target": target, "target_sha": target_sha, "source": source, "source_sha": source_sha}
+
+
+def integrate_attempts(args):
+    if args.attempts is not None:
+        return args.attempts
+    try:
+        n = int(os.environ.get("WOMBAT_INTEGRATE_ATTEMPTS", "3"))
+    except ValueError:
+        n = 3
+    return n if n >= 1 else 3
+
+
 def _cmd_integrate(args):
     """Rebase a clean, checked-out local branch, validate, then fast-forward here.
 
-    Both worktrees share the common-dir queue. No checkout/stash/reset/force or
-    worktree deletion. Conflicts stay in the source worktree for human review.
+    0.9 (W1): the queue lock is held only for two short moments -- a snapshot of the
+    target before the rebase and the final "target unchanged? then fast-forward" --
+    so other sessions keep committing while the rebase and the checks run. If the
+    target moved in between, the branch is rebased and checked again, up to
+    --attempts times. No checkout/stash/reset/force. Conflicts stay in the source
+    worktree for human review. Branches/worktrees are removed only with --done, and
+    only for a worktree made by `isolate` whose branch is merged.
     """
     top, common = repo_info()
     sess, t0 = session_name(args), time.monotonic()
-    rec = {"op": "integrate", "repo": top, "session": sess, "branch": args.rebase, "retries": 0}
-    branch = args.rebase
     if any(os.environ.get(k) for k in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")):
         eprint("wombat-gate: integrate refuses Git index/worktree/directory overrides; use normal worktrees")
         return EXIT_USAGE
+    branch, entry = args.rebase, None
+    if branch is None:
+        entry = find_isolate(common, session=sess)
+        if entry is None:
+            eprint("wombat-gate: give --rebase BRANCH, or --as NAME of a worktree made by `wombat-gate isolate`")
+            return EXIT_USAGE
+        branch = entry["branch"]
+    elif args.done:
+        entry = find_isolate(common, branch=branch)
+    if args.done and entry is None:
+        eprint("wombat-gate: --done only cleans up a worktree made by `wombat-gate isolate`")
+        return EXIT_USAGE
+    rec = {"op": "integrate", "repo": top, "session": sess, "branch": branch, "retries": 0,
+           "attempts": 0, "hold_s": 0.0}
     if branch.startswith("-") or git(["check-ref-format", "refs/heads/" + branch]).returncode:
         eprint("wombat-gate: give an existing local branch name")
         return EXIT_USAGE
@@ -1447,89 +1512,105 @@ def _cmd_integrate(args):
     if any(not c for c in checks):
         eprint("wombat-gate: empty --check")
         return EXIT_USAGE
+    attempts = integrate_attempts(args)
+
+    def fin(rc):
+        rec["total_s"] = time.monotonic() - t0
+        return finish(rec, rc)
+
+    qpath, first_sha = lock_path_for(common), None
     try:
-        with QueueLock(lock_path_for(common), sess, "integrate", args.timeout) as lk:
-            rec.update(wait_s=lk.wait_s, t_acq=time.time())
-            try:
-                target = check_step(git(["symbolic-ref", "-q", "HEAD"], cwd=top), "target-branch").stdout.strip()
-                if target == "refs/heads/" + branch:
-                    raise ValueError("source and target branches must differ; run from the target worktree")
-                target_sha = head_sha(top)
-                if not target_sha:
-                    raise ValueError("target must have a commit")
-                worktrees = check_step(git(["worktree", "list", "--porcelain", "-z"], cwd=top), "worktrees").stdout
-                source, here = None, None
-                for field in worktrees.split("\0"):
-                    if field.startswith("worktree "):
-                        here = field[9:]
-                    elif field == "branch refs/heads/" + branch:
-                        source = here
-                if source is None:
-                    raise ValueError("source branch must already be checked out in a separate worktree")
-                if integration_state(top) or integration_state(source):
-                    raise ValueError("merge/rebase/cherry-pick/revert in progress; finish or abort it first")
-                if integration_dirty(source):
-                    raise ValueError("source worktree is dirty; commit its files first")
-                source_sha = head_sha(source)
-                base = check_step(git(["merge-base", target_sha, source_sha], cwd=top), "merge-base").stdout.strip()
-                target_changes = set(check_step(git(["diff", "--name-only", "-z", base, target_sha], cwd=top), "target-diff").stdout.split("\0")) - {""}
-                source_ignored = integration_dirty(source, include_ignored=True)
-                if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for p in source_ignored for q in target_changes):
-                    raise ValueError("source has ignored files overlapping target changes; rebase would overwrite them")
-                if check_step(git(["rev-list", "--merges", base + ".." + source_sha], cwd=source), "merge-check").stdout.strip():
-                    raise ValueError("source has merge commits; manual review required before linear rebase")
-                touched = set(check_step(git(["diff", "--name-only", "-z", base, source_sha], cwd=top), "source-diff").stdout.split("\0")) - {""}
-                dirty = integration_dirty(top, include_ignored=True)
-                overlap = sorted(p for p in dirty if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for q in touched))
-                if overlap:
-                    raise ValueError("target has uncommitted files overlapping the branch: " + repr(overlap))
-                if args.dry_run:
-                    print("wombat-gate: rebase %s (%s) onto %s (%s); checks=%s; then ff-only" %
-                          (branch, source, target, target_sha, repr(args.check)))
-                    rec["result"] = "dry_run"
-                    return finish_locked(rec, lk, t0, EXIT_OK)
-                rb = git(["-c", "rebase.autoStash=false", "-c", "rebase.updateRefs=false", "-c", "rebase.autoSquash=false",
-                          "rebase", "--no-autostash", target_sha], cwd=source)
-                if rb.returncode:
-                    eprint(rb.stdout, rb.stderr)
-                    eprint("wombat-gate: rebase stopped in %s; target not advanced. Review there; no automatic conflict resolution." % source)
-                    rec["result"] = "rebase_stopped"
-                    return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
-                rebased = head_sha(source)
-                for command in checks:
-                    print("wombat-gate: check in %s: %s" % (source, shlex.join(command) if hasattr(shlex, "join") else repr(command)), flush=True)
-                    rc = run_integration_check(command, source, args.check_timeout)
-                    if rc:
+        for attempt in range(1, attempts + 1):
+            rec["attempts"] = attempt
+            # 1) short lock: validate and note the target
+            with QueueLock(qpath, sess, "integrate", args.timeout) as lk:
+                try:
+                    if attempt == 1:
+                        rec.update(wait_s=lk.wait_s, t_acq=time.time())
+                    snap = _integrate_snapshot(top, branch)
+                    if args.dry_run:
+                        print("wombat-gate: rebase %s (%s) onto %s (%s); checks=%s; then ff-only (up to %d attempt(s); "
+                              "the queue is held only for the snapshot and the fast-forward)" %
+                              (branch, snap["source"], snap["target"], snap["target_sha"], repr(args.check), attempts))
+                        rec["result"] = "dry_run"
+                        return fin(EXIT_OK)
+                finally:
+                    rec["hold_s"] += lk.hold_s
+            source, target_sha = snap["source"], snap["target_sha"]
+            first_sha = first_sha or snap["source_sha"]
+            # 2) outside the queue: rebase and checks; other sessions keep committing
+            rb = git(["-c", "rebase.autoStash=false", "-c", "rebase.updateRefs=false", "-c", "rebase.autoSquash=false",
+                      "rebase", "--no-autostash", target_sha], cwd=source)
+            if rb.returncode:
+                conflicts = [p for p in git(["diff", "--name-only", "--diff-filter=U", "-z"], cwd=source).stdout.split("\0") if p]
+                eprint(rb.stdout, rb.stderr)
+                eprint("wombat-gate: rebase stopped in %s (branch %s); target not advanced.%s Resolve there "
+                       "(git rebase --continue) or give up (git rebase --abort, then the branch is back at %s); "
+                       "no automatic conflict resolution."
+                       % (source, branch, (" Conflicting files: " + ", ".join(conflicts) + ".") if conflicts else "",
+                          first_sha))
+                rec.update(result="rebase_stopped", conflicts=conflicts[:20])
+                return fin(EXIT_GIT_ERROR)
+            rebased = head_sha(source)
+            for command in checks:
+                print("wombat-gate: check in %s: %s" % (source, shlex.join(command) if hasattr(shlex, "join") else repr(command)), flush=True)
+                rc = run_integration_check(command, source, args.check_timeout)
+                if rc:
+                    raise ValueError(
+                        "check failed (exit %d); target not advanced; source branch %s was rebased from %s; "
+                        "rebased source retained; revert with: git -C %s reset --hard %s"
+                        % (rc, branch, first_sha, shlex.quote(source), first_sha))
+            if (head_sha(source) != rebased or integration_dirty(source) or integration_state(source)
+                    or git(["symbolic-ref", "-q", "HEAD"], cwd=source).stdout.strip() != "refs/heads/" + branch):
+                raise ValueError("checks changed source HEAD/worktree; target not advanced")
+            touched = set(check_step(git(["diff", "--name-only", "-z", target_sha, rebased], cwd=top), "source-diff").stdout.split("\0")) - {""}
+            # 3) short lock: fast-forward only if the target is where the checks saw it
+            with QueueLock(qpath, sess, "integrate", args.timeout) as lk:
+                try:
+                    if git(["symbolic-ref", "-q", "HEAD"], cwd=top).stdout.strip() != snap["target"]:
+                        raise ValueError("target worktree switched branch during integration; target not advanced")
+                    if integration_state(top):
+                        raise ValueError("target operation started during checks; target not advanced")
+                    now = head_sha(top)
+                    if now != target_sha:
+                        if attempt < attempts:
+                            print("wombat-gate: target moved during checks (%s -> %s); rebasing again (attempt %d of %d)"
+                                  % (target_sha[:12], (now or "?")[:12], attempt + 1, attempts), flush=True)
+                            rec["retries"] += 1
+                            continue
                         raise ValueError(
-                            "check failed (exit %d); target not advanced; source branch %s was rebased from %s; "
-                            "rebased source retained; revert with: git -C %s reset --hard %s"
-                            % (rc, branch, source_sha, shlex.quote(source), source_sha))
-                if (head_sha(source) != rebased or integration_dirty(source) or integration_state(source)
-                        or git(["symbolic-ref", "-q", "HEAD"], cwd=source).stdout.strip() != "refs/heads/" + branch):
-                    raise ValueError("checks changed source HEAD/worktree; target not advanced")
-                if head_sha(top) != target_sha or git(["symbolic-ref", "-q", "HEAD"], cwd=top).stdout.strip() != target:
-                    raise ValueError("target moved during integration; target not advanced by wombat-gate")
-                if integration_state(top):
-                    raise ValueError("target operation started during checks; target not advanced")
-                dirty = integration_dirty(top, include_ignored=True)
-                if any(p == q or p.startswith(q + "/") or q.startswith(p + "/") for p in dirty for q in touched):
-                    raise ValueError("target files now overlap the source; target not advanced")
-                # Git itself rejects any tracked or untracked overwrite; never force.
-                ff = git(["-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", rebased], cwd=top)
-                if ff.returncode:
-                    eprint(ff.stdout, ff.stderr)
-                    rec["result"] = "ff_failed"
-                    return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
-                print("wombat-gate: integrated %s -> %s at %s" % (branch, target, rebased))
-                rec.update(result="integrated", commit=rebased, source=source)
-                return finish_locked(rec, lk, t0, EXIT_OK)
-            except (ValueError, GitStepFailed, HeadUnreadable, OSError, subprocess.TimeoutExpired) as e:
-                eprint("wombat-gate: integration stopped:", getattr(getattr(e, "r", None), "stderr", str(e)))
-                rec["result"] = "stopped"
-                return finish_locked(rec, lk, t0, EXIT_GIT_ERROR)
-    except TimeoutError:
-        rec.update(result="queue_timeout", total_s=time.monotonic() - t0)
-        return finish(rec, EXIT_LOCK_TIMEOUT)
+                            "target moved during checks (%s -> %s) and all %d attempt(s) are used; target not advanced; "
+                            "source branch %s was rebased from %s (revert: git -C %s reset --hard %s). "
+                            "Run integrate again, or raise --attempts / WOMBAT_INTEGRATE_ATTEMPTS"
+                            % (target_sha[:12], (now or "?")[:12], attempts, branch, first_sha, shlex.quote(source), first_sha))
+                    dirty = integration_dirty(top, include_ignored=True)
+                    if any(paths_overlap(p, q) for p in dirty for q in touched):
+                        raise ValueError("target files now overlap the source; target not advanced")
+                    # Git itself rejects any tracked or untracked overwrite; never force.
+                    ff = git(["-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", rebased], cwd=top)
+                    if ff.returncode:
+                        eprint(ff.stdout, ff.stderr)
+                        rec["result"] = "ff_failed"
+                        return fin(EXIT_GIT_ERROR)
+                finally:
+                    rec["hold_s"] += lk.hold_s
+            print("wombat-gate: integrated %s -> %s at %s" % (branch, snap["target"], rebased))
+            rec.update(result="integrated", commit=rebased, source=source)
+            fin(EXIT_OK)
+            if args.done:
+                rc = isolate_done(top, common, entry, args.timeout)
+                if rc:
+                    eprint("wombat-gate: integrated, but cleaning up the isolated worktree did not finish (see above)")
+                return rc
+            return EXIT_OK
+    except TimeoutError:                 # before OSError: TimeoutError is one
+        rec["result"] = "queue_timeout"
+        return fin(EXIT_LOCK_TIMEOUT)
+    except (ValueError, GitStepFailed, HeadUnreadable, OSError, subprocess.TimeoutExpired) as e:
+        eprint("wombat-gate: integration stopped:", getattr(getattr(e, "r", None), "stderr", str(e)))
+        rec["result"] = "stopped"
+        return fin(EXIT_GIT_ERROR)
+    return fin(EXIT_GIT_ERROR)  # not reached: the last attempt either integrates or raises
 
 
 def cmd_status(args):
@@ -1862,6 +1943,450 @@ def cmd_log(args):
 # ---------------------------------------------------------------- cli
 
 # Side view: head and ear on the left, round back, stubby legs, backside plugging the burrow.
+# ---------------------------------------------------------------- claims and isolated worktrees (0.9)
+#
+# Two small registries live next to the queue lock (a local disk, never the repository),
+# keyed by the git common dir, so every worktree of a repository shares them:
+#   <repo>-<hash>.claims.json    which session reserved which repository-relative path
+#   <repo>-<hash>.isolates.json  worktrees made by `isolate`
+# A short flock on <repo>-<hash>.registry.lock guards each read-modify-write.
+# Each entry records the agent process it was made for (CLAUDE_PID, WOMBAT_OWNER_PID,
+# else the nearest ancestor that is not a shell). A claim whose process is gone is
+# dropped the next time anyone reads the registry; an isolated worktree never is
+# (it may hold work), `claims` just marks its owner gone.
+
+OWNER_SKIP = {"bash", "sh", "zsh", "dash", "fish", "ksh", "env", "timeout", "nice", "ionice", "nohup",
+              "setsid", "stdbuf", "time", "xargs", "flock", "wombat-gate", "dingo-pack"}
+OWNER_STOP = {"init", "systemd", "tmux: server", "tmux", "screen", "sshd", "login", "su", "sudo",
+              "SessionLeader", "Relay", "agetty", "launchd"}
+
+
+def proc_comm(pid):
+    try:
+        with open("/proc/%d/comm" % int(pid)) as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def proc_ppid(pid):
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            st = f.read()
+        return int(st[st.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def owner_process():
+    """(pid, start, name) of the agent process this command works for, or (None, None, None).
+
+    A claim made without an owner (a human shell under tmux / ssh, or macOS without
+    $CLAUDE_PID / $WOMBAT_OWNER_PID) stays until it is released."""
+    for k in ("WOMBAT_OWNER_PID", "CLAUDE_PID"):
+        v = os.environ.get(k, "")
+        if v.isdigit() and pid_alive(int(v)):
+            return int(v), proc_start(int(v)), proc_comm(int(v)) or k
+    pid = os.getppid()
+    for _ in range(16):
+        if not pid or pid <= 1:
+            break
+        comm = proc_comm(pid)
+        if comm is None or comm in OWNER_STOP:
+            break
+        if comm not in OWNER_SKIP:
+            return pid, proc_start(pid), comm
+        pid = proc_ppid(pid)
+    return None, None, None
+
+
+def owner_fields():
+    pid, start, comm = owner_process()
+    return {"owner_pid": pid, "owner_start": start, "owner": comm, "host": socket.gethostname()}
+
+
+def row_alive(r):
+    pid = r.get("owner_pid")
+    if not pid or r.get("host") not in (None, socket.gethostname()):
+        return True                      # nothing to check against: keep it
+    return pid_alive(pid, r.get("owner_start"))
+
+
+def describe_owner(r):
+    if not r.get("owner_pid"):
+        return "no owner process recorded"
+    return "%s pid %s, %s" % (r.get("owner") or "?", r["owner_pid"], "alive" if row_alive(r) else "gone")
+
+
+def explicit_session(args, what):
+    s = (getattr(args, "session", None) or os.environ.get("WOMBAT_SESSION") or "").strip()
+    if not s:
+        eprint("wombat-gate: %s needs a session name: --as NAME (or $WOMBAT_SESSION)" % what)
+        return None
+    return s
+
+
+def registry_paths(common):
+    base = lock_path_for(common)[:-len(".lock")]
+    return base + ".claims.json", base + ".isolates.json", base + ".registry.lock"
+
+
+class RegistryLock:
+    """Short exclusive flock around one read-modify-write of the registries."""
+
+    def __init__(self, common, timeout=30.0):
+        self.path, self.timeout, self.fd = registry_paths(common)[2], timeout, None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        end = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() > end:
+                    os.close(self.fd)
+                    self.fd = None
+                    eprint("wombat-gate: the claims registry %s stayed locked for %.0fs" % (self.path, self.timeout))
+                    raise TimeoutError
+                time.sleep(0.02)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+def load_rows(path, key):
+    d = read_ticket(path)
+    rows = d.get(key) if isinstance(d, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def save_rows(path, key, rows):
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, key: rows}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def paths_overlap(a, b):
+    """Same path, or one is a directory above the other."""
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
+def live_claims(common, prune):
+    """Claims whose owner is alive; with prune=True (registry lock held) the rest are
+    removed from disk and reported."""
+    cpath = registry_paths(common)[0]
+    rows = load_rows(cpath, "claims")
+    live = [r for r in rows if row_alive(r)]
+    if prune and len(live) != len(rows):
+        for g in rows:
+            if g not in live:
+                eprint("wombat-gate: cleared stale claim of %s on %s (%s)" % (g.get("session"), g.get("path"), describe_owner(g)))
+        save_rows(cpath, "claims", live)
+    return live
+
+
+def claim_locked(common, sess, rels, quiet=False):
+    """Register rels for sess unless another session holds an overlapping path. All or nothing."""
+    live = live_claims(common, prune=True)
+    hits = [(p, r) for p in rels for r in live if r.get("session") != sess and paths_overlap(p, r.get("path", ""))]
+    if hits:
+        eprint("wombat-gate: claim refused for %s; these paths overlap what other sessions hold:" % sess)
+        for p, r in hits:
+            eprint("  %s  <->  %s   held by %s since %s (%s)" % (p, r.get("path"), r.get("session"), r.get("since", "?"), describe_owner(r)))
+        eprint("wombat-gate: nothing was claimed. Settle who goes first with them, take other paths, "
+               "or work in your own worktree (`wombat-gate isolate`) and integrate with checks.")
+        return EXIT_CLAIMED
+    own = owner_fields()
+    held = {r["path"] for r in live if r.get("session") == sess}
+    for r in live:
+        if r.get("session") == sess:
+            r.update(own)                # the latest process working for this name owns all of it
+    for p in rels:
+        if p not in held:
+            live.append(dict(own, session=sess, path=p, t=time.time(), since=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+            held.add(p)
+    save_rows(registry_paths(common)[0], "claims", live)
+    if not quiet:
+        print("wombat-gate: %s holds: %s" % (sess, ", ".join(sorted(held))))
+    return EXIT_OK
+
+
+def release_locked(common, sess, rels=None):
+    cpath = registry_paths(common)[0]
+    live = live_claims(common, prune=True)
+    drop = [r for r in live if r.get("session") == sess and (rels is None or r.get("path") in rels)]
+    if drop:
+        save_rows(cpath, "claims", [r for r in live if r not in drop])
+    return [r["path"] for r in drop]
+
+
+def claim_rels(paths, top):
+    check_paths(paths, top, False)          # literal paths inside the repository, else exit 2
+    return repo_rel_paths(paths, top)
+
+
+def cmd_claim(args):
+    sess = explicit_session(args, "claim")
+    if not sess:
+        return EXIT_USAGE
+    top, common = repo_info()
+    rels = claim_rels(args.paths, top)
+    try:
+        with RegistryLock(common):
+            return claim_locked(common, sess, rels)
+    except TimeoutError:
+        return EXIT_LOCK_TIMEOUT
+
+
+def cmd_release(args):
+    sess = explicit_session(args, "release")
+    if not sess:
+        return EXIT_USAGE
+    top, common = repo_info()
+    rels = set(claim_rels(args.paths, top)) if args.paths else None
+    try:
+        with RegistryLock(common):
+            gone = release_locked(common, sess, rels)
+    except TimeoutError:
+        return EXIT_LOCK_TIMEOUT
+    if not gone:
+        eprint("wombat-gate: %s holds none of %s" % (sess, ", ".join(sorted(rels)) if rels else "anything here"))
+        return EXIT_NOTHING
+    print("wombat-gate: released for %s: %s" % (sess, ", ".join(sorted(gone))))
+    return EXIT_OK
+
+
+def cmd_claims(args):
+    top, common = repo_info()
+    try:
+        with RegistryLock(common):
+            live = live_claims(common, prune=True)
+            isolates = load_rows(registry_paths(common)[1], "isolates")
+    except TimeoutError:
+        return EXIT_LOCK_TIMEOUT
+    for r in isolates:
+        r["owner_alive"], r["exists"] = row_alive(r), os.path.isdir(r.get("path", ""))
+    if args.json:
+        print(json.dumps({"claims": live, "isolates": isolates}, ensure_ascii=False, indent=1))
+        return EXIT_OK
+    if not live and not isolates:
+        print("wombat-gate: no claims and no isolated worktrees in %s" % top)
+        return EXIT_OK
+    for r in sorted(live, key=lambda r: (r.get("session", ""), r.get("path", ""))):
+        print("claim    %-36s %-40s since %s (%s)" % (r.get("session"), r.get("path"), r.get("since", "?"), describe_owner(r)))
+    for r in isolates:
+        print("isolate  %-36s %s  branch %s -> %s  since %s (%s)%s"
+              % (r.get("session"), r.get("path"), r.get("branch"), r.get("target", "?").replace("refs/heads/", ""),
+                 r.get("since", "?"), describe_owner(r), "" if r["exists"] else "  [worktree missing]"))
+    return EXIT_OK
+
+
+def claim_hint(common, top, sess, paths):
+    """Before a commit: say (never block) when a path lies outside the session's claims
+    or inside someone else's. Silent when nobody in the repository uses claims."""
+    try:
+        if not os.path.exists(registry_paths(common)[0]):
+            return
+        live = live_claims(common, prune=False)
+        if not live:
+            return
+        mine = sorted(r["path"] for r in live if r.get("session") == sess)
+        for p in repo_rel_paths(paths, top):
+            others = [r for r in live if r.get("session") != sess and paths_overlap(p, r.get("path", ""))]
+            if others:
+                eprint("wombat-gate: note: %s overlaps %s" % (p, "; ".join(
+                    "%s claimed by %s" % (r.get("path"), r.get("session")) for r in others)))
+            elif mine and not any(p == m or p.startswith(m + "/") for m in mine):
+                eprint("wombat-gate: note: %s is not in your claims (%s holds: %s)" % (p, sess, ", ".join(mine)))
+    except (OSError, ValueError):
+        pass
+
+
+def list_worktrees(top):
+    """[(path, 'refs/heads/...' or None)] from `git worktree list --porcelain -z`."""
+    out = check_step(git(["worktree", "list", "--porcelain", "-z"], cwd=top), "worktrees").stdout
+    rows = []
+    for field in out.split("\0"):
+        if field.startswith("worktree "):
+            rows.append([field[9:], None])
+        elif field.startswith("branch ") and rows:
+            rows[-1][1] = field[7:]
+    return [tuple(r) for r in rows]
+
+
+def ref_safe(name):
+    s = re.sub(r"[\s~^:?*\[\\\x00-\x1f\x7f/]+", "-", name)
+    s = re.sub(r"\.\.+", ".", s).replace("@{", "@-")
+    s = s.strip(".-") or "session"
+    return s[:-5] + "-lock" if s.endswith(".lock") else s
+
+
+def find_isolate(common, session=None, branch=None):
+    for r in load_rows(registry_paths(common)[1], "isolates"):
+        if (session is not None and r.get("session") == session) or (branch is not None and r.get("branch") == branch):
+            return r
+    return None
+
+
+def ref_sha(ref, cwd):
+    r = git(["rev-parse", "--verify", "-q", ref + "^{commit}"], cwd=cwd)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def cmd_isolate(args):
+    sess = explicit_session(args, "isolate")
+    if not sess:
+        return EXIT_USAGE
+    top, common = repo_info()
+    if args.done:
+        if args.paths:
+            eprint("wombat-gate: isolate --done takes no paths")
+            return EXIT_USAGE
+        entry = find_isolate(common, session=sess)
+        if entry is None:
+            eprint("wombat-gate: no isolated worktree is registered for %s" % sess)
+            return EXIT_NOTHING
+        return isolate_done(top, common, entry, args.timeout)
+    rels = claim_rels(args.paths, top) if args.paths else []
+    target = git(["symbolic-ref", "-q", "HEAD"], cwd=top).stdout.strip()
+    try:
+        head = head_sha(top)
+    except HeadUnreadable as e:
+        eprint("wombat-gate: cannot read HEAD:", e)
+        return EXIT_GIT_ERROR
+    if not target or not head:
+        eprint("wombat-gate: isolate needs a branch with at least one commit checked out here (the target to integrate into)")
+        return EXIT_USAGE
+    branch = "wombat/" + ref_safe(sess)
+    if git(["check-ref-format", "refs/heads/" + branch]).returncode:
+        branch = "wombat/s-" + hashlib.sha1(sess.encode()).hexdigest()[:10]
+    main_top = list_worktrees(top)[0][0]
+    root = args.dir or os.environ.get("WOMBAT_ISOLATE_ROOT") or os.path.join(
+        os.path.dirname(main_top), os.path.basename(main_top) + ".wombat")
+    path = os.path.join(os.path.abspath(root), ref_safe(sess))
+    _, ipath, _ = registry_paths(common)
+    try:
+        with RegistryLock(common):
+            rows = load_rows(ipath, "isolates")
+            old = next((r for r in rows if r.get("session") == sess), None)
+            if old is not None:
+                if os.path.isdir(old.get("path", "")) and ref_sha("refs/heads/" + old.get("branch", ""), top):
+                    if rels and claim_locked(common, sess, rels):
+                        return EXIT_CLAIMED
+                    print("wombat-gate: %s is already isolated in %s (branch %s)" % (sess, old["path"], old["branch"]))
+                    return EXIT_OK
+                eprint("wombat-gate: %s has a registered worktree %s (branch %s) that is missing; "
+                       "run `wombat-gate isolate --done --as %s` to clear it" % (sess, old.get("path"), old.get("branch"), sess))
+                return EXIT_USAGE
+            if target == "refs/heads/" + branch:
+                eprint("wombat-gate: run isolate from the target worktree, not from inside %s" % branch)
+                return EXIT_USAGE
+            if ref_sha("refs/heads/" + branch, top):
+                eprint("wombat-gate: branch %s already exists and was not made by isolate for %s; "
+                       "use another --as name or deal with that branch first" % (branch, sess))
+                return EXIT_USAGE
+            if os.path.lexists(path):
+                eprint("wombat-gate: %s already exists; use another --as name or --dir" % path)
+                return EXIT_USAGE
+            if rels and claim_locked(common, sess, rels):
+                return EXIT_CLAIMED       # reported; no worktree made
+            with QueueLock(lock_path_for(common), sess, "isolate", args.timeout):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                r = git(["worktree", "add", "-q", "-b", branch, path, head], cwd=top)
+            if r.returncode:
+                eprint(r.stderr.strip())
+                if rels:
+                    release_locked(common, sess, set(rels))
+                return EXIT_GIT_ERROR
+            rows.append(dict(owner_fields(), session=sess, branch=branch, path=path, target=target,
+                             target_worktree=top, base=head, t=time.time(),
+                             since=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+            save_rows(ipath, "isolates", rows)
+    except TimeoutError:
+        return EXIT_LOCK_TIMEOUT
+    q = shlex.quote
+    print("wombat-gate: isolated %s in %s (branch %s from %s at %s)" % (sess, path, branch, target.replace("refs/heads/", ""), head[:12]))
+    print("  work and commit there:  cd %s && wombat-gate commit --as %s -m MSG -- PATH..." % (q(path), q(sess)))
+    print("  hand in, from %s:  wombat-gate integrate --as %s --check 'TEST COMMAND' --done" % (q(top), q(sess)))
+    return EXIT_OK
+
+
+def isolate_done(top, common, entry, timeout):
+    """Remove an isolated worktree and its branch once the branch is merged into its target.
+    Never forces: a dirty worktree, an operation in progress or an unmerged branch stops it."""
+    sess, path, branch = entry.get("session"), entry.get("path", ""), entry.get("branch", "")
+    target = entry.get("target") or "HEAD"
+    rp, cwd = os.path.realpath(path), os.path.realpath(os.getcwd())
+    if cwd == rp or cwd.startswith(rp + os.sep):
+        eprint("wombat-gate: run this from the target worktree, not from inside %s" % path)
+        return EXIT_USAGE
+    try:
+        with RegistryLock(common):
+            expected_sha = ref_sha("refs/heads/" + branch, top)
+            with QueueLock(lock_path_for(common), sess, "isolate-done", timeout):
+                # A queued source commit may have landed since cleanup was requested.
+                # Validate under the same lock as removal, before touching the worktree.
+                bsha = ref_sha("refs/heads/" + branch, top)
+                if bsha != expected_sha:
+                    eprint("wombat-gate: branch %s changed while waiting for the queue (%s -> %s); "
+                           "worktree and branch retained; inspect and integrate before retrying cleanup"
+                           % (branch, expected_sha or "missing", bsha or "missing"))
+                    return EXIT_GIT_ERROR
+                listed = any(os.path.realpath(p) == rp for p, _ in list_worktrees(top))
+                if listed and os.path.isdir(path):
+                    if integration_state(path):
+                        eprint("wombat-gate: a rebase/merge is in progress in %s; finish or abort it there first" % path)
+                        return EXIT_GIT_ERROR
+                    dirty = sorted(integration_dirty(path))
+                    if dirty:
+                        eprint("wombat-gate: %s has uncommitted files %s; commit (and integrate) or move them first"
+                               % (path, repr(dirty[:10])))
+                        return EXIT_GIT_ERROR
+                if bsha:
+                    tsha = ref_sha(target, top)
+                    if not tsha or git(["merge-base", "--is-ancestor", bsha, tsha], cwd=top).returncode:
+                        eprint("wombat-gate: branch %s has commits that are not in %s; integrate it first: "
+                               "wombat-gate integrate --as %s --check 'TEST COMMAND' --done"
+                               % (branch, target.replace("refs/heads/", ""), shlex.quote(sess)))
+                        return EXIT_GIT_ERROR
+                ignored = sorted(integration_dirty(path, include_ignored=True)) if listed and os.path.isdir(path) else []
+                if listed:
+                    r = git(["worktree", "remove", path], cwd=top)       # no --force: git re-checks it is clean
+                    if r.returncode:
+                        eprint(r.stderr.strip())
+                        return EXIT_GIT_ERROR
+                if bsha:
+                    r = git(["update-ref", "-d", "refs/heads/" + branch, bsha], cwd=top)   # only if unchanged
+                    if r.returncode:
+                        eprint(r.stderr.strip())
+                        return EXIT_GIT_ERROR
+            _, ipath, _ = registry_paths(common)
+            save_rows(ipath, "isolates", [r for r in load_rows(ipath, "isolates") if r.get("session") != sess])
+            released = release_locked(common, sess)
+    except TimeoutError:
+        return EXIT_LOCK_TIMEOUT
+    except (GitStepFailed, HeadUnreadable, OSError) as e:
+        eprint("wombat-gate: cleanup stopped:", getattr(getattr(e, "r", None), "stderr", str(e)))
+        return EXIT_GIT_ERROR
+    print("wombat-gate: done: %s%s%s" % (
+        "removed worktree %s" % path if listed else "worktree %s was already gone" % path,
+        "; deleted branch %s (merged into %s)" % (branch, target.replace("refs/heads/", "")) if bsha else "",
+        "; released %s" % ", ".join(released) if released else ""))
+    if ignored:
+        print("wombat-gate: ignored files removed with the worktree: %s%s"
+              % (", ".join(ignored[:10]), " ..." if len(ignored) > 10 else ""))
+    if listed and os.path.isdir(path):
+        eprint("wombat-gate: note: %s still exists on disk" % path)
+    return EXIT_OK
+
+
 WOMBAT = "\n".join([
     '   ^  .-"""""""""-.  _____',
     '  (o)/             \\/#####\\',
@@ -1880,7 +2405,8 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--session", help="name recorded in the log/holder file (default $WOMBAT_SESSION)")
+        sp.add_argument("--session", "--as", dest="session",
+                        help="session name recorded in the log/holder file and the claims (default $WOMBAT_SESSION)")
         sp.add_argument("--timeout", type=float, default=env_float("WOMBAT_TIMEOUT", 600),
                         help="seconds to wait for the queue lock (default 600 or $WOMBAT_TIMEOUT)")
 
@@ -1900,11 +2426,36 @@ def main(argv=None):
 
     it = sub.add_parser("integrate", allow_abbrev=False, help="rebase a branch in its worktree, check, then fast-forward here")
     common(it)
-    it.add_argument("--rebase", required=True, metavar="BRANCH")
+    it.add_argument("--rebase", metavar="BRANCH", help="the branch to integrate (default: the one `isolate --as NAME` made)")
     it.add_argument("--check", action="append", help="required check command, split as argv without a shell; repeatable")
     it.add_argument("--check-timeout", type=float, default=600, help="seconds per check (default 600)")
+    it.add_argument("--attempts", type=int, default=None,
+                    help="rebase+check rounds when the target keeps moving (default 3 or $WOMBAT_INTEGRATE_ATTEMPTS)")
+    it.add_argument("--done", action="store_true",
+                    help="after integrating, remove the isolated worktree and its merged branch")
     it.add_argument("-n", "--dry-run", action="store_true")
     it.set_defaults(func=cmd_integrate)
+
+    cl = sub.add_parser("claim", allow_abbrev=False, help="reserve paths for a session; overlaps with other sessions are refused (exit 7)")
+    common(cl)
+    cl.add_argument("paths", nargs="*")
+    cl.set_defaults(func=cmd_claim)
+
+    rl = sub.add_parser("release", allow_abbrev=False, help="drop a session's reservations (all, or the given paths)")
+    common(rl)
+    rl.add_argument("paths", nargs="*")
+    rl.set_defaults(func=cmd_release)
+
+    cs = sub.add_parser("claims", allow_abbrev=False, help="list reservations and isolated worktrees of this repository")
+    cs.add_argument("--json", action="store_true")
+    cs.set_defaults(func=cmd_claims)
+
+    iso = sub.add_parser("isolate", allow_abbrev=False, help="give a session its own worktree + branch beside the repository")
+    common(iso)
+    iso.add_argument("--done", action="store_true", help="remove the worktree and its branch (only once merged and clean)")
+    iso.add_argument("--dir", help="parent directory for isolated worktrees (default <repo>.wombat beside the repository, or $WOMBAT_ISOLATE_ROOT)")
+    iso.add_argument("paths", nargs="*", help="paths to claim for the session at the same time")
+    iso.set_defaults(func=cmd_isolate)
 
     s = sub.add_parser("status", allow_abbrev=False, help="short status of the given paths only, without taking index.lock")
     s.add_argument("-u", "--untracked-files", dest="untracked", default="normal",
@@ -1944,6 +2495,9 @@ def main(argv=None):
         return EXIT_USAGE
     if not math.isfinite(getattr(args, "check_timeout", 1)) or getattr(args, "check_timeout", 1) <= 0:
         eprint("wombat-gate: --check-timeout must be > 0")
+        return EXIT_USAGE
+    if getattr(args, "attempts", None) is not None and args.attempts < 1:
+        eprint("wombat-gate: --attempts must be >= 1")
         return EXIT_USAGE
     return args.func(args)
 

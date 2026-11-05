@@ -95,9 +95,30 @@ wombat-gate run -- git push                    # push、fetch、tag、log 等（
 wombat-gate who                                # 现在谁在洞里
 wombat-gate log -n 50                          # 最近的耗时记录（加 --stats 看 p50 / p95）
 wombat-gate doctor                             # git 的锁文件：有人在用、像是残留，还是我们自己的
+wombat-gate claim --as agent-7 -- src/parser   # 开工先占路径；和别人重叠就当场拒绝（退出码 7）
+wombat-gate claims                             # 谁占了什么、有哪些隔离区
+wombat-gate release --as agent-7               # 交完件把路径放回去
+wombat-gate isolate --as agent-7               # 在仓库旁边给自己开一个 worktree + 分支
+wombat-gate integrate --as agent-7 --check 'make test' --done   # rebase、检查、快进，再收掉隔离区
 ```
 
-设 `WOMBAT_SESSION=agent-7`（或加 `--session`），`who` 里就能看到是谁。
+设 `WOMBAT_SESSION=agent-7`（或加 `--session` / `--as`），`who` 里就能看到是谁。
+
+## 🔀 三种用法怎么选（0.9）
+
+| 情况 | 用什么 | 会发生什么 |
+|---|---|---|
+| 小改动，各 agent 改不同文件，共用一个工作树 | 只用 `commit -- <路径>` | 提交排队过一把锁，每次只提交自己点名的路径。 |
+| 并行改同一个工作树里**分开的**几块 | 开工 `claim`，交件 `release` | 第二个占到重叠路径（同一路径，或上下级目录）的 agent 当场被告知是谁占着、哪几条重叠，退出码 7——谁都还没动手。`commit` 时提交了自己没占的路径也会提示。 |
+| 并行改**同一片**代码 | `isolate`，交件 `integrate --done` | 每个 agent 在仓库旁边有自己的 worktree 和分支。交件时 rebase 到目标当前位置、跑检查、快进，然后收掉 worktree 和已并进的分支。有冲突就停在那个 agent 的 worktree 里，列出冲突文件。 |
+
+**和别家「每个 agent 一个 worktree」比**（OpenCode、Codex 这类工具的做法）：它们的 worktree 让 agent 干活时互不干扰，撞车要到合并时才暴露。wombat-gate 多了三样：
+
+1. **开工就报重叠。** `claim`（以及 `isolate -- <路径>`）对照这个仓库所有 worktree 里还活着的会话占的路径，两个 agent 奔着同一个目录去，开工那一刻就知道，不用等合并。
+2. **合回带检查。** `integrate` rebase 到目标*现在*的位置、跑必需的检查，目标在这期间没动才快进；动了就重新 rebase、重新检查（`--attempts`，默认 3 次）。队列锁只在开头和快进时各占一下，长检查期间别的 agent 照样提交。
+3. **合完自动收，而且不硬来。** `--done` 只在分支已并进、worktree 干净时才删 worktree 和分支，不带 force。
+
+会话的 agent 进程退出后，它占的路径在下一次有人查看时自动清掉；隔离区不会自动清（里面可能有没交的活），`claims` 只标出主人已经不在。
 
 ## 🤖 在 Claude Code 里用
 
@@ -110,7 +131,8 @@ wombat-gate doctor                             # git 的锁文件：有人在用
 - 只有用 wombat-gate 的进程才会排队，所以所有 agent 都要换过来。
 - 锁要放在本地盘上；Windows 那边的 git 看不到 WSL 里的锁。
 - 只加快提交；`git status`、`git log` 在慢盘上还是慢。
-- 两个 agent 改同一个文件，先提交的会把两边的改动一起带走。最好给每个 agent 分开的目录。
+- 两个 agent 在同一个工作树改同一个文件，先提交的会把两边的改动一起带走。给每个 agent 分开的路径（`claim`），或分开的 worktree（`isolate`）。
+- 占路径是提醒性质的：重叠的占用会被拒绝，提交越界会提示，但不拦提交。
 - WSL 内存用光时，Windows 盘可能掉线。这不是 wombat-gate 引起的，但耗时长的 git 命令最容易碰上。
 
 ## ✅ 自测
@@ -119,13 +141,16 @@ wombat-gate doctor                             # git 的锁文件：有人在用
 python3 selftest_wombat_gate.py               # 1–7 分钟，看机器忙不忙；在本地盘上建临时仓库
 python3 selftest_wombat_gate.py --mutants     # 把 44 个修过的 bug 放回去，每个都必须被抓到
 bash hooks/selftest_guard.sh                  # 197 条命令，逐条核守卫该拦还是该放
+python3 selftest_release.py                   # 0.8 回归：删除、改名、integrate（25 条）
+python3 selftest_isolate.py                   # 0.9：占路径、隔离区、integrate 不整段占锁（23 条）
 ```
 
 每次快速提交的结果，都会和在仓库副本上直接跑 `git commit` 的结果对比。
 
 ## 📍 版本
 
-- 0.8.0 候选：已暂存删除 / 改名、文件数核对、带检查的 worktree 合回和发布校验。详见 [CHANGELOG](CHANGELOG.md)。
+- 0.9.0 候选：`claim` / `release` / `claims` 占路径，`isolate` 隔离区配 `integrate --done`，`integrate` 在 rebase 和检查期间不再占着队列锁。
+- 0.8.0：已暂存删除 / 改名、文件数核对、带检查的 worktree 合回和发布校验。详见 [CHANGELOG](CHANGELOG.md)。
 
 - 0.7.0：自己留下的 `index.lock` 自己收；`doctor`；耗时 p50 / p95。
 - 0.6.2：之前 / 之后的图、语言切换行。
@@ -145,18 +170,19 @@ wombat-gate commit    --expect-files 2 -m '笔记改名' -- '旧目录/笔记.md
 
 预演每个发生变化的**路径**占一行，改名旧、新各一行。文件名用 UTF-8 JSON 引号表示，文件名里的换行不会多占一行。摘要「删 N / 改名 N / 改 N」分别是：不含改名源的删除路径数、改名对数、其他变化路径数（含新增）。一次改名占两行、一对。`--expect-files N` 会在队列锁内再次核数，不一致就退出 2；搬家时 N 写逐个点名的变化文件数。目录参数会展开，N 要写展开后的文件数，不是目录参数数。不加这个参数保留原有递归提交用法。选中路径以外，别人的暂存内容保持原样。
 
-## worktree 分支合回主线（0.8）
+## worktree 分支合回主线
 
 在**目标** worktree 执行：先把已提交的源分支 rebase 到目标当前 HEAD，在源 worktree 跑点名检查，通过后目标只快进。
 
 ```sh
 wombat-gate integrate -n --rebase topic --check 'python3 tests/run_all.py'
 wombat-gate integrate    --rebase topic --check 'python3 tests/run_all.py' --check 'python3 tests/regression.py'
+wombat-gate integrate    --as agent-7   --check 'python3 tests/run_all.py' --done   # isolate 开的隔离区
 ```
 
-源分支必须已经在另一个 worktree 检出，没有受跟踪文件改动和非忽略的未跟踪文件。至少给一个 `--check`；命令拆成 argv 执行，不经过 shell，不支持管道、重定向、shell 展开；`--check-timeout` 默认每条 600 秒。两棵 worktree 共用仓库队列锁，覆盖 rebase、检查、快进。目标可以留着别人不重叠的暂存 / 未暂存内容；受跟踪、未跟踪和忽略文件与分支路径重叠都会拒绝。源里的忽略文件若会被目标改动覆盖也会拒绝。检查结束时源 HEAD 和受跟踪 / 非忽略文件必须不变。
+源分支必须已经在另一个 worktree 检出，没有受跟踪文件改动和非忽略的未跟踪文件。至少给一个 `--check`；命令拆成 argv 执行，不经过 shell，不支持管道、重定向、shell 展开；`--check-timeout` 默认每条 600 秒。仓库队列锁只短占两次：开头核对并记下目标位置，最后确认目标没动再快进。rebase 和检查在锁外跑，别的会话照样提交；目标在这期间动了，就重新 rebase、重新检查，最多 `--attempts` 次（默认 3，或 `WOMBAT_INTEGRATE_ATTEMPTS`）。目标可以留着别人不重叠的暂存 / 未暂存内容；受跟踪、未跟踪和忽略文件与分支路径重叠都会拒绝。源里的忽略文件若会被目标改动覆盖也会拒绝。检查结束时源 HEAD 和受跟踪 / 非忽略文件必须不变。
 
-冲突停在源 worktree，保留 rebase 状态，到那里检查后明确继续或中止再重试。检查失败保留已 rebase 的源分支，目标不前进。源分支有合并提交时交人工审；目标 HEAD 变化、已有进行中操作、路径重叠也会停。分支和 worktree 保留，不自动 stash、强改分支、解冲突或清理目录。普通 git 进程不共用队列，仍须协调。
+冲突停在源 worktree，保留 rebase 状态，到那里检查后明确继续或中止再重试。检查失败保留已 rebase 的源分支，目标不前进。源分支有合并提交时交人工审；目标一直在动超过次数上限、目标换了分支、已有进行中操作、路径重叠也会停。不自动 stash、强改分支或解冲突。只有 `--done`（或 `isolate --done`）会删分支和 worktree，而且只删 `isolate` 开的、分支已并进、worktree 干净的；里面被 git 忽略的文件（缓存、构建产物）跟着一起删。普通 git 进程不共用队列，仍须协调。
 
 ## 平台支持
 
@@ -180,7 +206,7 @@ CLI 与模型、供应商无关。下面给项目规矩和明确的 agent 标记
 ```
 
 ```text
-只通过 wombat-gate 提交卡上分配的文件。搬家先用 --expect-files N 预演，旧新路径都点名，再用同一个数真提交；文件清单不符就停。只合已验收分支，integrate 带卡点名的 --check。任务要求批准的推送和发布等批准再做。
+开工先用 `wombat-gate claim --as <会话名> -- <路径>` 占卡上分配的路径，报重叠就停；交完件 release。只通过 wombat-gate 提交卡上分配的文件。搬家先用 --expect-files N 预演，旧新路径都点名，再用同一个数真提交；文件清单不符就停。只合已验收分支，integrate 带卡点名的 --check。任务要求批准的推送和发布等批准再做。
 ```
 
 **Codex**：同一段规矩放仓库 `AGENTS.md`（[官方说明](https://learn.chatgpt.com/docs/agent-configuration/agents-md)），这样启动：
