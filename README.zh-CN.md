@@ -6,7 +6,7 @@
 
 **一次只放一个进洞。** 几个 AI agent 共用一个 git 仓库时，让它们排队提交，而且每个只提交自己的文件。
 
-🌐 [English](https://github.com/liyifreddy/wombat-gate/blob/main/README.md) · **中文**
+🌐 [English](https://github.com/liyifreddy/wombat-gate/blob/main/README.md) · [Deutsch](https://github.com/liyifreddy/wombat-gate/blob/main/README.de.md) · **中文**
 
 ## 🚀 快速上手
 

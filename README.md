@@ -8,7 +8,7 @@
 **One at a time through the burrow.** A commit queue for AI agents sharing one git
 repository: they wait their turn, and each commits only its own files.
 
-🌐 **English** · [中文](https://github.com/liyifreddy/wombat-gate/blob/main/README.zh-CN.md)
+🌐 **English** · [Deutsch](https://github.com/liyifreddy/wombat-gate/blob/main/README.de.md) · [中文](https://github.com/liyifreddy/wombat-gate/blob/main/README.zh-CN.md)
 
 ## 🚀 Quick start
 
