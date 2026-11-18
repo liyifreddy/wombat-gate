@@ -380,5 +380,74 @@ class W1Tests(Base):
         self.assertEqual(rec.get('result'), 'integrated')
 
 
+class PathGuardTests(Base):
+    """0.9.1: empty named paths, large named directories, paths in another repository."""
+
+    def many(self, n, d='big'):
+        for i in range(n):
+            self.write('%s/f%03d.txt' % (d, i), 'x%d\n' % i)
+
+    def test_empty_path_refused(self):
+        self.write('mine/x.txt', 'x\n')
+        head = self.git('rev-parse', 'HEAD')
+        for argv in (['--', ''], ['--', 'mine/x.txt', ''], ['--', ' ']):
+            r = self.gate('commit', '-m', 'x', *argv)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('empty', r.stderr)
+        r = self.gate('commit', '-m', 'x', '--')   # unset shell variable: nothing after --
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('unset', r.stderr)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+
+    def test_large_directory_refused_then_confirmed(self):
+        self.many(12)
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        head = self.git('rev-parse', 'HEAD')
+        r = self.gate('commit', '-m', 'x', '--', 'big', env=env)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('big/f000.txt', r.stderr)
+        self.assertIn('12', r.stderr)
+        self.assertIn('--confirm-large', r.stderr)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+        dry = self.gate('commit', '-n', '-m', 'x', '--', 'big', env=env)
+        self.assertEqual(dry.returncode, 2, dry.stderr)
+        ok = self.gate('commit', '--confirm-large', '-m', 'x', '--', 'big', env=env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertNotEqual(self.git('rev-parse', 'HEAD'), head)
+
+    def test_large_directory_ok_with_expect_files_or_files_named(self):
+        self.many(12)
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        r = self.gate('commit', '--expect-files', '12', '-m', 'x', '--', 'big', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.many(12, 'big2')
+        names = ['big2/f%03d.txt' % i for i in range(12)]
+        r = self.gate('commit', '-m', 'y', '--', *names, env=env)   # files, not a directory
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_small_directory_unaffected_by_default_threshold(self):
+        self.many(5)
+        r = self.gate('commit', '-m', 'x', '--', 'big')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_path_in_another_repo_says_where(self):
+        other = ROOT / 'PathGuardTests-other'
+        other.mkdir(parents=True, exist_ok=True)
+        self.git('init', '-q', '-b', 'main', cwd=other)
+        self.write('f.txt', 'f\n', where=other)
+        r = self.gate('commit', '-n', '-m', 'x', '--', str(other / 'f.txt'))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('not in the current repository', r.stderr)
+        self.assertIn(os.path.realpath(str(self.repo)), r.stderr)
+        self.assertIn(os.path.realpath(str(other)), r.stderr)
+        plain = ROOT / 'PathGuardTests-plain' / 'g.txt'
+        plain.parent.mkdir(parents=True, exist_ok=True)
+        plain.write_text('g\n')
+        r = self.gate('commit', '-n', '-m', 'x', '--', str(plain))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('not in the current repository', r.stderr)
+        self.assertIn('not inside any git repository', r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

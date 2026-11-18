@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.1 — candidate
+
+- `commit` refuses a named directory that holds more changed files than `WOMBAT_MAX_DIR_FILES` (default 200; an unset path variable once handed a whole output tree to `git add --all` on a 9p mount). The error lists the first files; `--confirm-large` or `--expect-files N` lets it through. Applies to `--dry-run` too.
+- An empty path or an empty list after `--` now says it is probably an unset shell variable.
+- A path in another repository says which repository it belongs to ("not in the current repository X; it belongs to the repository Y: go there and commit it").
+- New `PathGuardTests` in `selftest_isolate.py` (5 tests).
+
 ## 0.9.0 — 2026-11-04 (unreleased)
 
 - Add `claim` / `release` / `claims`: sessions reserve repository-relative paths at the start of work; an overlapping claim by another session (same path, or a parent / child directory, in any worktree of the repository) is refused with the holder's name and exit 7. Claims end with the owning agent process (`$CLAUDE_PID`, `$WOMBAT_OWNER_PID`, or the nearest non-shell ancestor). `commit` notes paths outside your claims or inside someone else's, without blocking.

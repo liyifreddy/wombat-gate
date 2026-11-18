@@ -97,6 +97,8 @@ same about our directories.)
 - **No stuck locks.** If the holder dies, the kernel drops the lock. Nothing to clean up.
 - **Path checks.** `.`, the repo root, globs and `:` pathspecs are refused, so nobody
   commits the whole tree by accident.
+  A named directory with more than 200 changed files (`WOMBAT_MAX_DIR_FILES`) is refused
+  too, unless you pass `--confirm-large`; so is an empty path (an unset variable).
 - **Why it's fast.** Your paths are staged in a private copy of the index and grafted
   onto `HEAD`. The branch moves only if nobody else moved it, and git's own index lock is
   held the whole time. Every self-test run checks the result against plain `git commit`.
@@ -183,6 +185,7 @@ Every fast commit is compared with what plain `git commit` does on a copy of the
 
 ## 📍 Status
 
+- 0.9.1 candidate — refuses empty paths and large named directories, and says which repository an outside path belongs to.
 - 0.9.0 candidate — `claim` / `release` / `claims`, `isolate` worktrees with `integrate --done`, and `integrate` no longer holds the queue during rebase and checks.
 - 0.8.0 — staged deletion/rename support, reviewed file counts, checked worktree integration and release checks. See [CHANGELOG](CHANGELOG.md).
 

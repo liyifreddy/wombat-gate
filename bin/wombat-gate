@@ -46,7 +46,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 EXIT_OK = 0
 EXIT_GIT_ERROR = 1
@@ -65,6 +65,7 @@ LOCKFILE_IN_MSG = re.compile(r"'([^']+\.lock)'")
 
 # Characters that make a pathspec match more than the literal path.
 GLOB_CHARS = set("*?")
+MAX_DIR_FILES = 200       # a named directory with more changed files than this needs --confirm-large
 
 # `wombat-gate run` allow-list. Value: (needs the queue lock, safe to retry on a lock collision).
 # Everything else -- add, commit, stash, reset, checkout, restore, switch, clean,
@@ -262,7 +263,9 @@ def check_paths(paths, top, allow_broad):
     or outside it. '[' and ']' are allowed: with GIT_LITERAL_PATHSPECS they only
     match a file of that exact name. Returns that git env."""
     if not paths:
-        eprint("wombat-gate: give the paths to act on after `--` (e.g. wombat-gate commit -m msg -- src/mydir)")
+        eprint("wombat-gate: no paths after `--`. If they came from a shell variable it is probably "
+               "unset or empty (check it, and quote it: \"$VAR\"). Give the paths to act on "
+               "(e.g. wombat-gate commit -m msg -- src/mydir)")
         sys.exit(EXIT_USAGE)
     if allow_broad:
         if escape_refused("--allow-broad"):
@@ -272,7 +275,7 @@ def check_paths(paths, top, allow_broad):
     for p in paths:
         why = None
         if not p.strip():
-            why = "empty path"
+            why = "empty path (an unset or empty shell variable?)"
         elif p.startswith(":"):
             why = "pathspec magic (':' prefix) is not allowed"
         elif GLOB_CHARS & set(p):
@@ -286,12 +289,58 @@ def check_paths(paths, top, allow_broad):
             if rp == top_real:
                 why = "this is the whole repository"
             elif not rp.startswith(top_real + os.sep):
-                why = "outside the repository"
+                why = "not in the current repository %s; %s" % (top_real, other_repo_hint(rp))
         if why:
             eprint("wombat-gate: refusing path %r: %s. Name your own files or directories%s"
                    % (p, why, escape_hint("--allow-broad")))
             sys.exit(EXIT_USAGE)
     return {"GIT_LITERAL_PATHSPECS": "1"}
+
+
+def other_repo_hint(real_path):
+    """For a path outside the current repository: say where it belongs."""
+    d = real_path
+    while d and not os.path.isdir(d):
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    r = git(["rev-parse", "--show-toplevel"], cwd=d) if d and os.path.isdir(d) else None
+    if r is not None and r.returncode == 0 and r.stdout.strip():
+        return "it belongs to the repository %s: go there and commit it" % os.path.realpath(r.stdout.strip())
+    return "it is not inside any git repository"
+
+
+def max_dir_files():
+    try:
+        return max(1, int(os.environ.get("WOMBAT_MAX_DIR_FILES", MAX_DIR_FILES)))
+    except ValueError:
+        return MAX_DIR_FILES
+
+
+def check_large_dirs(args, top, lit):
+    """A named directory with more changed files than the threshold is refused unless
+    --confirm-large or --expect-files (a reviewed count) is given. Returns an exit code or None."""
+    if args.allow_broad or args.confirm_large or args.expect_files is not None:
+        return None
+    if not any(os.path.isdir(p) and not os.path.islink(p) for p in args.paths):
+        return None
+    limit = max_dir_files()
+    r = git(["status", "--porcelain", "-z", "--untracked-files=all", "--"] + args.paths,
+            env_extra=dict(lit, GIT_OPTIONAL_LOCKS="0"))   # cwd: the paths are relative to it
+    if r.returncode != 0:
+        return None   # the real command will report the git error
+    entries = [e for e in (r.stdout or "").split("\0") if e]
+    # rename records carry a second, bare path field; status codes are two chars + space
+    files = [e[3:] for e in entries if len(e) > 3 and e[2] == " "]
+    if len(files) <= limit:
+        return None
+    eprint("wombat-gate: refusing: the named paths hold %d changed files (limit %d). "
+           "A directory name may have been meant as a few files, or a path variable was wrong. First: %s%s. "
+           "Name the files, or pass --confirm-large (or --expect-files %d after a --dry-run review) "
+           "if you really mean all of them; WOMBAT_MAX_DIR_FILES changes the limit."
+           % (len(files), limit, ", ".join(files[:5]), ", ..." if len(files) > 5 else "", len(files)))
+    return EXIT_USAGE
 
 
 # ---------------------------------------------------------------- the queue lock
@@ -580,6 +629,9 @@ def cmd_commit(args):
     t0 = time.monotonic()
     top, common = repo_info()
     lit = check_paths(args.paths, top, args.allow_broad)
+    rc = check_large_dirs(args, top, lit)
+    if rc is not None:
+        return rc
     if not args.message and not args.file:
         eprint("wombat-gate: commit needs -m MSG or -F FILE")
         return EXIT_USAGE
@@ -2419,6 +2471,8 @@ def main(argv=None):
     c.add_argument("-q", "--quiet", action="store_true")
     c.add_argument("--no-verify", action="store_true", help="passed through to git commit")
     c.add_argument("--expect-files", type=int, help="refuse unless the preview contains exactly N changed file paths")
+    c.add_argument("--confirm-large", action="store_true",
+                   help="allow a named directory holding more changed files than WOMBAT_MAX_DIR_FILES (default %d)" % MAX_DIR_FILES)
     c.add_argument("--allow-broad", action="store_true",
                    help="allow '.', the repo root, globs and ':' pathspec magic")
     c.add_argument("paths", nargs="*")
