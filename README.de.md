@@ -111,7 +111,7 @@ Verzeichnissen empfinden wir genauso.)
   welchem er gehört. `release --as NAME --` ohne etwas nach `--` wird abgelehnt, statt
   alles freizugeben.
 - **Warum es schnell ist.** Deine Pfade werden in einer privaten Kopie des Index gestaged und auf
-  `HEAD` aufgepfropft. Der Branch bewegt sich nur, wenn ihn niemand sonst bewegt hat, und Gits eigenes
+  `HEAD` eingehängt. Der Branch bewegt sich nur, wenn ihn niemand sonst bewegt hat, und Gits eigenes
   Index-Lock wird die ganze Zeit gehalten. Jeder Selbsttest-Lauf vergleicht das Ergebnis mit einem normalen `git commit`.
 - **Status nur für deine Pfade**: `wombat-gate status -- PATH...`.
 - **Nur für Menschen gedachte Flags** (`--allow-broad`, `run --unsafe`) werden innerhalb von Agenten abgelehnt.
