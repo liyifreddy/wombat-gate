@@ -1,11 +1,13 @@
 # Changelog
 
-## 0.9.1 — candidate
+## 0.9.1 — 2026-11-18
 
 - `commit` refuses a named directory that holds more changed files than `WOMBAT_MAX_DIR_FILES` (default 200; an unset path variable once handed a whole output tree to `git add --all` on a 9p mount). The error lists the first files; `--confirm-large` or `--expect-files N` lets it through. Applies to `--dry-run` too.
 - An empty path or an empty list after `--` now says it is probably an unset shell variable.
 - A path in another repository says which repository it belongs to ("not in the current repository X; it belongs to the repository Y: go there and commit it").
-- New `PathGuardTests` in `selftest_isolate.py` (5 tests).
+- Fixes from the independent review: a deleted named directory is counted too; renames count both ends, the same as `--dry-run` / `--expect-files`; the refusal says how to preview (`--dry-run --expect-files N`); an agent cannot use `--confirm-large` (human only, like `--allow-broad`; agents use `--expect-files N`); an invalid `WOMBAT_MAX_DIR_FILES` warns; the other-repo message says "run it there"; rename records are parsed by structure.
+- `release --as NAME --` with no path after `--` is refused (it used to release everything the session holds); `isolate --as NAME --` with no path says nothing is claimed.
+- New `PathGuardTests` in `selftest_isolate.py` (15 tests).
 
 ## 0.9.0 — 2026-11-04 (unreleased)
 

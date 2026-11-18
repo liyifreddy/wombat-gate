@@ -79,7 +79,7 @@ wombat-gate who                                   # 现在谁在洞里
 
 - **锁不会卡死**：拿着锁的进程死了，系统会自动放锁，不会留下要手动删的锁文件。
 - **路径检查**：`.`、仓库根目录、通配符、`:` 开头的特殊路径都不接受，免得一不小心提交整个仓库。
-  点名的目录里要提交的文件超过 200 个（`WOMBAT_MAX_DIR_FILES` 可改）也拒绝，要提交全部请加 `--confirm-large`；空路径（多半是变量没赋值）同样拒绝；路径在别的仓时会告诉你它属于哪个仓。
+  点名的目录里要提交的文件超过 200 个（`WOMBAT_MAX_DIR_FILES` 可改）也拒绝，已删掉的目录同样算，改名两端都算（和 `--dry-run` 一致）。人要提交全部可加 `--confirm-large`；agent（设了 `CLAUDECODE` 等）和 `--allow-broad` 一样不能用它，只能用 `--expect-files N`，N 取自预演（单独 `-n` 也被挡，写 `--dry-run --expect-files N`）。空路径（多半是变量没赋值）同样拒绝；路径在别的仓时会告诉你它属于哪个仓；`release --as NAME --` 后面没有路径时拒绝，不再释放全部占用。
 - **为什么快**：在索引的一份副本里只暂存你的路径，再把这些路径接到当前提交上；移动分支时先确认没有别人动过它；整个过程拿着 git 自己的索引锁，别的 git 进程插不进来。每次自测都和真正的 `git commit` 对比结果。
 - **只看自己的状态**：`wombat-gate status -- 路径`。
 - **给人用的开关**：`--allow-broad`、`run --unsafe` 在 agent 里一律拒绝。
@@ -143,7 +143,7 @@ python3 selftest_wombat_gate.py               # 1–7 分钟，看机器忙不�
 python3 selftest_wombat_gate.py --mutants     # 把 44 个修过的 bug 放回去，每个都必须被抓到
 bash hooks/selftest_guard.sh                  # 197 条命令，逐条核守卫该拦还是该放
 python3 selftest_release.py                   # 0.8 回归：删除、改名、integrate（25 条）
-python3 selftest_isolate.py                   # 0.9：占路径、隔离区、integrate 不整段占锁（23 条）
+python3 selftest_isolate.py                   # 0.9：占路径、隔离区、integrate 不整段占锁、路径检查（39 条）
 ```
 
 每次快速提交的结果，都会和在仓库副本上直接跑 `git commit` 的结果对比。

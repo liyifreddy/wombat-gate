@@ -430,6 +430,119 @@ class PathGuardTests(Base):
         r = self.gate('commit', '-m', 'x', '--', 'big')
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def commit_many(self, n, d='big'):
+        self.many(n, d)
+        self.git('add', '--', d)
+        self.git('commit', '-qm', 'add ' + d)
+
+    def test_deleted_large_directory_refused(self):
+        self.commit_many(12)
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        for how in ('rm', 'git rm'):
+            if how == 'rm':
+                import shutil
+                shutil.rmtree(str(self.repo / 'big'))
+            else:
+                self.git('rm', '-rq', 'big')
+            head = self.git('rev-parse', 'HEAD')
+            r = self.gate('commit', '-m', 'x', '--', 'big', env=env)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('12', r.stderr)
+            self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+            ok = self.gate('commit', '--expect-files', '12', '-m', 'x', '--', 'big', env=env)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.git('reset', '-q', '--hard', 'HEAD~1')
+
+    def test_renamed_large_directory_counts_both_ends(self):
+        self.commit_many(12)
+        self.git('mv', 'big', 'big2')
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        r = self.gate('commit', '-m', 'x', '--', 'big', 'big2', env=env)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('24 changed files', r.stderr)
+        self.assertIn('--expect-files 24', r.stderr)
+        pre = self.gate('commit', '-n', '--expect-files', '24', '-m', 'x', '--', 'big', 'big2', env=env)
+        self.assertEqual(pre.returncode, 0, pre.stderr)
+        self.assertIn('files=24', pre.stdout)
+        ok = self.gate('commit', '--expect-files', '24', '-m', 'x', '--', 'big', 'big2', env=env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_renames_below_directory_count_as_pairs(self):
+        self.commit_many(8, 'c')
+        self.git('mv', 'c', 'c2')
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        r = self.gate('commit', '-m', 'x', '--', 'c', 'c2', env=env)   # 8 pairs = 16 paths
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('16', r.stderr)
+
+    def test_error_names_the_dry_run_form(self):
+        self.many(12)
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10')
+        r = self.gate('commit', '-m', 'x', '--', 'big', env=env)
+        self.assertIn('--dry-run --expect-files 12', r.stderr)
+
+    def test_agent_cannot_use_confirm_large(self):
+        self.many(12)
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='10', CLAUDECODE='1')
+        head = self.git('rev-parse', 'HEAD')
+        for extra in ([], ['-n']):
+            r = self.gate('commit', '--confirm-large', *extra, '-m', 'x', '--', 'big', env=env)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('--expect-files', r.stderr)
+            self.assertIn('human-only', r.stderr)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+        r = self.gate('commit', '-m', 'x', '--', 'big', env=env)   # the refusal points at --expect-files only
+        self.assertNotIn('--confirm-large', r.stderr)
+        ok = self.gate('commit', '--expect-files', '12', '-m', 'x', '--', 'big', env=env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.many(12, 'big3')
+        env2 = dict(env, WOMBAT_HUMAN_OVERRIDE='1')
+        ok = self.gate('commit', '--confirm-large', '-m', 'y', '--', 'big3', env=env2)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_bad_threshold_warns(self):
+        self.many(3)
+        for bad in ('abc', '0', '-5'):
+            r = self.gate('commit', '-n', '-m', 'x', '--', 'big', env=dict(self.env, WOMBAT_MAX_DIR_FILES=bad))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('WOMBAT_MAX_DIR_FILES', r.stderr)
+
+    def test_other_repo_says_run_it_there(self):
+        other = ROOT / 'PathGuardTests-other2'
+        other.mkdir(parents=True, exist_ok=True)
+        self.git('init', '-q', '-b', 'main', cwd=other)
+        self.write('f.txt', 'f\n', where=other)
+        r = self.gate('claim', '--as', 's', '--', str(other / 'f.txt'))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('run it there', r.stderr)
+        self.assertNotIn('commit it', r.stderr)
+
+    def test_rename_old_path_with_space_third_char(self):
+        # a rename's old path is a bare field; one whose 3rd character is a space must not be miscounted
+        self.write('ab c.txt', 'x\n')
+        self.git('add', '--', 'ab c.txt')
+        self.git('commit', '-qm', 'sp')
+        self.git('mv', 'ab c.txt', 'z.txt')
+        env = dict(self.env, WOMBAT_MAX_DIR_FILES='2')
+        r = self.gate('commit', '-m', 'x', '--', 'ab c.txt', 'z.txt', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)   # 2 paths = 2 entries, not 3
+
+    def test_empty_release_refused(self):
+        a = self.gate('claim', '--as', 'S-A', '--', 'src/a')
+        self.assertEqual(a.returncode, 0, a.stderr)
+        r = self.gate('release', '--as', 'S-A', '--')
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn('no paths after', r.stderr)
+        held = self.gate('claims')
+        self.assertIn('src/a', held.stdout)
+        ok = self.gate('release', '--as', 'S-A')   # no `--`: release all, as before
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_isolate_empty_paths_notes(self):
+        r = self.gate('isolate', '--as', 'S-I', '--')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no paths after', r.stderr)
+
     def test_path_in_another_repo_says_where(self):
         other = ROOT / 'PathGuardTests-other'
         other.mkdir(parents=True, exist_ok=True)

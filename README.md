@@ -98,7 +98,13 @@ same about our directories.)
 - **Path checks.** `.`, the repo root, globs and `:` pathspecs are refused, so nobody
   commits the whole tree by accident.
   A named directory with more than 200 changed files (`WOMBAT_MAX_DIR_FILES`) is refused
-  too, unless you pass `--confirm-large`; so is an empty path (an unset variable).
+  too (a deleted directory counts, and a rename counts both ends, as in `--dry-run`).
+  A human can pass `--confirm-large`; an agent (`CLAUDECODE` etc. set) cannot, as with
+  `--allow-broad`, and uses `--expect-files N` with the count from a `--dry-run` review
+  (plain `--dry-run` is refused too; use `--dry-run --expect-files N`). An empty path
+  (an unset variable) is refused, and a path in another repository says which one it
+  belongs to. `release --as NAME --` with nothing after `--` is refused instead of
+  releasing everything.
 - **Why it's fast.** Your paths are staged in a private copy of the index and grafted
   onto `HEAD`. The branch moves only if nobody else moved it, and git's own index lock is
   held the whole time. Every self-test run checks the result against plain `git commit`.
@@ -178,7 +184,7 @@ python3 selftest_wombat_gate.py               # 1–7 min depending on load, thr
 python3 selftest_wombat_gate.py --mutants     # 44 past bugs put back; each must turn a check red
 bash hooks/selftest_guard.sh                  # 197 commands the guard must block or let through
 python3 selftest_release.py                   # 0.8 regressions: deletions, renames, integrate (25)
-python3 selftest_isolate.py                   # 0.9: claims, isolated worktrees, integrate without holding the queue (23)
+python3 selftest_isolate.py                   # 0.9: claims, isolated worktrees, integrate without holding the queue, path guards (39)
 ```
 
 Every fast commit is compared with what plain `git commit` does on a copy of the repo.

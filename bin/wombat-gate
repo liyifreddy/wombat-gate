@@ -230,11 +230,12 @@ AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_C
                  "WOMBAT_NO_ESCAPES", "DINGO_NO_ESCAPES")
 
 
-def escape_refused(flag):
+def escape_refused(flag, instead=None):
     if is_agent() and os.environ.get("WOMBAT_HUMAN_OVERRIDE") != "1":
         hit = [m for m in AGENT_MARKERS if os.environ.get(m, "") not in ("", "0")]
         eprint("wombat-gate: refusing %s: it is a human-only escape hatch and this looks like an "
-               "agent (%s set). Stop and ask the human; do not try to work around this." % (flag, ", ".join(hit)))
+               "agent (%s set). %s" % (flag, ", ".join(hit), instead or
+               "Stop and ask the human; do not try to work around this."))
         return True
     return False
 
@@ -307,39 +308,76 @@ def other_repo_hint(real_path):
         d = nd
     r = git(["rev-parse", "--show-toplevel"], cwd=d) if d and os.path.isdir(d) else None
     if r is not None and r.returncode == 0 and r.stdout.strip():
-        return "it belongs to the repository %s: go there and commit it" % os.path.realpath(r.stdout.strip())
+        return "it belongs to the repository %s: run it there" % os.path.realpath(r.stdout.strip())
     return "it is not inside any git repository"
 
 
 def max_dir_files():
-    try:
-        return max(1, int(os.environ.get("WOMBAT_MAX_DIR_FILES", MAX_DIR_FILES)))
-    except ValueError:
+    raw = os.environ.get("WOMBAT_MAX_DIR_FILES")
+    if raw is None:
         return MAX_DIR_FILES
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        eprint("wombat-gate: warning: WOMBAT_MAX_DIR_FILES=%r is not a positive integer; using %d"
+               % (raw, MAX_DIR_FILES))
+        return MAX_DIR_FILES
+    return n
+
+
+def status_paths(porcelain_z):
+    """Changed paths from `git status --porcelain -z`, both ends of a rename or copy
+    included (the same count as the --dry-run preview). A rename record is
+    `XY new\0old`: the old name is a bare field, so it is skipped as a record."""
+    fields = [f for f in porcelain_z.split("\0")]
+    out, i = [], 0
+    while i < len(fields):
+        e = fields[i]
+        i += 1
+        if len(e) < 4 or e[2] != " ":
+            continue
+        out.append(e[3:])
+        if e[0] in "RC" or e[1] in "RC":
+            if i < len(fields) and fields[i]:
+                out.append(fields[i])
+            i += 1
+    return out
 
 
 def check_large_dirs(args, top, lit):
     """A named directory with more changed files than the threshold is refused unless
-    --confirm-large or --expect-files (a reviewed count) is given. Returns an exit code or None."""
-    if args.allow_broad or args.confirm_large or args.expect_files is not None:
+    --expect-files (a reviewed count) or, for a human, --confirm-large is given.
+    Returns an exit code or None."""
+    if args.allow_broad:
         return None
-    if not any(os.path.isdir(p) and not os.path.islink(p) for p in args.paths):
+    if args.confirm_large and escape_refused(
+            "--confirm-large", "Agents use --expect-files N: count the files first (--dry-run), "
+            "then pass the exact number."):
+        return EXIT_USAGE
+    if args.confirm_large or args.expect_files is not None:
+        return None
+    # only a regular file or a symlink is certainly one entry; a directory, or a path
+    # that no longer exists (a deleted directory), may stand for many
+    if all(os.path.islink(p) or os.path.isfile(p) for p in args.paths):
         return None
     limit = max_dir_files()
     r = git(["status", "--porcelain", "-z", "--untracked-files=all", "--"] + args.paths,
             env_extra=dict(lit, GIT_OPTIONAL_LOCKS="0"))   # cwd: the paths are relative to it
     if r.returncode != 0:
         return None   # the real command will report the git error
-    entries = [e for e in (r.stdout or "").split("\0") if e]
-    # rename records carry a second, bare path field; status codes are two chars + space
-    files = [e[3:] for e in entries if len(e) > 3 and e[2] == " "]
+    files = status_paths(r.stdout or "")
     if len(files) <= limit:
         return None
-    eprint("wombat-gate: refusing: the named paths hold %d changed files (limit %d). "
+    how = ("pass --expect-files %d" % len(files) if is_agent() else
+           "pass --confirm-large, or --expect-files %d" % len(files))
+    eprint("wombat-gate: refusing: the named paths hold %d changed files (limit %d; a rename counts both ends). "
            "A directory name may have been meant as a few files, or a path variable was wrong. First: %s%s. "
-           "Name the files, or pass --confirm-large (or --expect-files %d after a --dry-run review) "
-           "if you really mean all of them; WOMBAT_MAX_DIR_FILES changes the limit."
-           % (len(files), limit, ", ".join(files[:5]), ", ..." if len(files) > 5 else "", len(files)))
+           "Name the files, or %s if you really mean all of them. To review first: "
+           "wombat-gate commit --dry-run --expect-files %d -m MSG -- PATH... (plain --dry-run is refused too). "
+           "WOMBAT_MAX_DIR_FILES changes the limit."
+           % (len(files), limit, ", ".join(files[:5]), ", ..." if len(files) > 5 else "", how, len(files)))
     return EXIT_USAGE
 
 
@@ -2202,6 +2240,11 @@ def cmd_release(args):
     if not sess:
         return EXIT_USAGE
     top, common = repo_info()
+    if getattr(args, "dashdash", False) and not args.paths:
+        eprint("wombat-gate: no paths after `--`; refusing to release everything %s holds. If they came "
+               "from a shell variable it is probably unset or empty (quote it: \"$VAR\"). To release "
+               "all, leave out `--`." % sess)
+        return EXIT_USAGE
     rels = set(claim_rels(args.paths, top)) if args.paths else None
     try:
         with RegistryLock(common):
@@ -2306,6 +2349,9 @@ def cmd_isolate(args):
             eprint("wombat-gate: no isolated worktree is registered for %s" % sess)
             return EXIT_NOTHING
         return isolate_done(top, common, entry, args.timeout)
+    if getattr(args, "dashdash", False) and not args.paths:
+        eprint("wombat-gate: note: no paths after `--`, so nothing is claimed. If they came from a "
+               "shell variable it is probably unset or empty (quote it: \"$VAR\").")
     rels = claim_rels(args.paths, top) if args.paths else []
     target = git(["symbolic-ref", "-q", "HEAD"], cwd=top).stdout.strip()
     try:
@@ -2538,6 +2584,7 @@ def main(argv=None):
     dr.set_defaults(func=cmd_doctor)
 
     args = p.parse_args(argv)
+    args.dashdash = "--" in (sys.argv[1:] if argv is None else list(argv))
     old = sorted(k for k in os.environ if k.startswith("GITQ_"))
     if old:  # gitq was this tool's name before 0.5; its settings are not read any more
         eprint("wombat-gate: warning: ignoring %s (gitq was renamed; use WOMBAT_* instead)" % ", ".join(old))
